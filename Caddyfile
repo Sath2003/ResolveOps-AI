@@ -1,0 +1,3 @@
+resolvesops-ai.sathvikdevops.site, resolveops-ai.sathvikdevops.site {
+    reverse_proxy frontend:3000
+}
