@@ -27,6 +27,7 @@ class Artifact(Base):
 class User(Base):
     __tablename__ = 'nexus_users'
     email = Column(String(255), primary_key=True)
+    user_id = Column(String(255), nullable=False, index=True)
     tenant_id = Column(String(255), nullable=False, index=True)
     full_name = Column(String(255))
     hashed_password = Column(String(255))

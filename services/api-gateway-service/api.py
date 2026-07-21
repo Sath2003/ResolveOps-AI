@@ -199,6 +199,7 @@ def register_user(user: UserAuth):
         item_to_put = {
             'email': user.email,
             'user_id': user_id,
+            'tenant_id': user_id,
             'full_name': full_name,
             'hashed_password': hashed_password,
             'created_at': datetime.datetime.utcnow().isoformat()
