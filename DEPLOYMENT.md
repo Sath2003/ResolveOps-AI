@@ -110,7 +110,10 @@ Ensure you update the following in `.env`:
 * `JWT_SECRET` (generate a secure random string)
 * `DB_PASSWORD` (use a strong password instead of `local-db-pass`)
 * `DATABASE_URL` (update password matching `DB_PASSWORD`)
-* Any AWS, GitHub, or AI API keys required for your services.
+* `AI_PROVIDER=openai` (tells the microservices to use OpenAI instead of AWS Bedrock)
+* `OPENAI_API_KEY` (your direct OpenAI API key starting with `sk-...`)
+* `OPENAI_MODEL_NAME=gpt-4o-mini` (or your preferred OpenAI model)
+* Any AWS or GitHub API keys required for your integrations.
 
 Save and exit (`Ctrl+O`, `Enter`, `Ctrl+X`).
 

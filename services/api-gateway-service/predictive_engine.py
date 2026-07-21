@@ -12,13 +12,22 @@ logger = logging.getLogger(__name__)
 
 class PredictiveEngine:
     def __init__(self):
-        aws_region = os.getenv("AWS_REGION", "us-east-1")
-        bedrock_client = boto3.client("bedrock-runtime", region_name=aws_region)
-        self.chat_model = ChatBedrock(
-            client=bedrock_client,
-            model_id=os.getenv("BEDROCK_MODEL_ID", "anthropic.claude-3-haiku-20240307-v1:0"),
-            model_kwargs={"temperature": 0.1}
-        )
+        ai_provider = os.getenv("AI_PROVIDER", "bedrock").lower()
+        if ai_provider == "openai":
+            from langchain_openai import ChatOpenAI
+            self.chat_model = ChatOpenAI(
+                api_key=os.getenv("OPENAI_API_KEY"),
+                model=os.getenv("OPENAI_MODEL_NAME", "gpt-4o-mini"),
+                temperature=0.1
+            )
+        else:
+            aws_region = os.getenv("AWS_REGION", "us-east-1")
+            bedrock_client = boto3.client("bedrock-runtime", region_name=aws_region)
+            self.chat_model = ChatBedrock(
+                client=bedrock_client,
+                model_id=os.getenv("BEDROCK_MODEL_ID", "anthropic.claude-3-haiku-20240307-v1:0"),
+                model_kwargs={"temperature": 0.1}
+            )
 
     def analyze_logs_and_predict(self, logs: List[Dict]) -> Tuple[bool, Optional[Dict]]:
         """

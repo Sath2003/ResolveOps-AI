@@ -119,5 +119,48 @@ Generate your analysis in valid JSON format with the following keys:
             }
         except Exception as e:
             raise HTTPException(status_code=500, detail=f"Amazon Bedrock error: {str(e)}")
+
+    elif ai_provider == "openai":
+        openai_api_key = os.getenv("OPENAI_API_KEY")
+        openai_model = os.getenv("OPENAI_MODEL_NAME", "gpt-4o-mini")
+        
+        if not openai_api_key:
+            raise HTTPException(status_code=500, detail="OpenAI API key not configured")
+            
+        try:
+            from langchain_openai import ChatOpenAI
+            from langchain_core.messages import HumanMessage, SystemMessage
+            
+            chat = ChatOpenAI(
+                api_key=openai_api_key,
+                model=openai_model,
+                temperature=0.1,
+            )
+            
+            res = chat.invoke([
+                SystemMessage(content="You are a helpful AI that returns strictly valid JSON."),
+                HumanMessage(content=prompt)
+            ])
+            
+            content = res.content
+            json_match = re.search(r'(\{.*\})', content, re.DOTALL)
+            if json_match:
+                content = json_match.group(1)
+            parsed = json.loads(content)
+            
+            return {
+                "status": "success",
+                "analysis": {
+                    "status": "ai_generated",
+                    "provider": "openai",
+                    "summary": parsed.get("summary", "Analysis"),
+                    "probable_root_cause": parsed.get("probable_root_cause", ""),
+                    "recommended_fix": parsed.get("recommended_fix", []),
+                    "evidence": parsed.get("evidence", []),
+                    "ai_provider_status": "available"
+                }
+            }
+        except Exception as e:
+            raise HTTPException(status_code=500, detail=f"OpenAI error: {str(e)}")
             
     raise HTTPException(status_code=500, detail="No valid AI provider configured")

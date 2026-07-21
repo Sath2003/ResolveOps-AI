@@ -9,18 +9,32 @@ from langchain_core.documents import Document
 
 class LogRageEngine:
     def __init__(self):
-        aws_region = os.getenv("AWS_REGION", "us-east-1")
-        bedrock_client = boto3.client("bedrock-runtime", region_name=aws_region)
+        ai_provider = os.getenv("AI_PROVIDER", "bedrock").lower()
+        if ai_provider == "openai":
+            from langchain_openai import ChatOpenAI, OpenAIEmbeddings
+            self.embeddings = OpenAIEmbeddings(
+                api_key=os.getenv("OPENAI_API_KEY"),
+                model="text-embedding-3-small"
+            )
+            self.chat_model = ChatOpenAI(
+                api_key=os.getenv("OPENAI_API_KEY"),
+                model=os.getenv("OPENAI_MODEL_NAME", "gpt-4o-mini"),
+                temperature=0.1,
+                max_tokens=4096
+            )
+        else:
+            aws_region = os.getenv("AWS_REGION", "us-east-1")
+            bedrock_client = boto3.client("bedrock-runtime", region_name=aws_region)
 
-        self.embeddings = BedrockEmbeddings(
-            client=bedrock_client,
-            model_id="amazon.titan-embed-text-v2:0"
-        )
-        self.chat_model = ChatBedrock(
-            client=bedrock_client,
-            model_id=os.getenv("BEDROCK_MODEL_ID", "meta.llama3-3-70b-instruct-v1:0"),
-            model_kwargs={"temperature": 0.1, "max_tokens": 4096}
-        )
+            self.embeddings = BedrockEmbeddings(
+                client=bedrock_client,
+                model_id="amazon.titan-embed-text-v2:0"
+            )
+            self.chat_model = ChatBedrock(
+                client=bedrock_client,
+                model_id=os.getenv("BEDROCK_MODEL_ID", "meta.llama3-3-70b-instruct-v1:0"),
+                model_kwargs={"temperature": 0.1, "max_tokens": 4096}
+            )
         self.vector_store = None
 
     def run_query(self, query: str, time_window_mins: int = 30, image_base64: str = None, cloud_logs_str: str = None, tenant_email: str = None) -> dict:
