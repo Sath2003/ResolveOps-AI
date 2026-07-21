@@ -1,0 +1,140 @@
+import os
+import uuid
+import datetime
+from sqlalchemy import create_engine, Column, String, DateTime, Float, JSON, Integer, Text, Boolean
+from sqlalchemy.orm import declarative_base, sessionmaker
+
+# Expects a standard PostgreSQL connection string
+DATABASE_URL = os.getenv("DATABASE_URL")
+if DATABASE_URL and DATABASE_URL.startswith("postgres://"):
+    DATABASE_URL = DATABASE_URL.replace("postgres://", "postgresql://", 1)
+
+Base = declarative_base()
+
+class Artifact(Base):
+    __tablename__ = 'artifacts'
+
+    id = Column(String(36), primary_key=True, default=lambda: str(uuid.uuid4()))
+    tenant_id = Column(String(255), nullable=False, index=True)
+    artifact_type = Column(String(50), nullable=False) # e.g., 'architecture', 'rca', 'report'
+    blob_container = Column(String(255), nullable=False)
+    blob_path = Column(String(1024), nullable=False)
+    file_name = Column(String(255), nullable=False)
+    content_type = Column(String(100), nullable=False)
+    created_at = Column(DateTime, default=datetime.datetime.utcnow)
+    status = Column(String(50), default="CREATED")
+
+class User(Base):
+    __tablename__ = 'nexus_users'
+    email = Column(String(255), primary_key=True)
+    tenant_id = Column(String(255), nullable=False, index=True)
+    full_name = Column(String(255))
+    hashed_password = Column(String(255))
+    created_at = Column(String(100))
+    reliability_score = Column(String(50), default="100.0")
+    integrations = Column(JSON, default=dict)
+
+class ApiKey(Base):
+    __tablename__ = 'nexus_api_keys'
+    api_key = Column(String(255), primary_key=True)
+    user_id = Column(String(255), index=True)
+    tenant_id = Column(String(255), index=True)
+    name = Column(String(255))
+    created_at = Column(String(100))
+    last_used = Column(String(100), nullable=True)
+    status = Column(String(50), default="active")
+
+class Incident(Base):
+    __tablename__ = 'nexus_incidents'
+    tenant_id = Column(String(255), primary_key=True)
+    incident_id = Column(String(255), primary_key=True)
+    title = Column(String(255))
+    status = Column(String(50))
+    severity = Column(String(50))
+    created_at = Column(String(100))
+    detected_at = Column(String(100))
+    description = Column(Text)
+    affected_resources = Column(JSON, default=list)
+    resolution_time = Column(String(100), nullable=True)
+    root_cause = Column(Text, nullable=True)
+    ai_analysis = Column(Text, nullable=True)
+    remediation_steps = Column(JSON, default=list)
+
+class Log(Base):
+    __tablename__ = 'nexus_logs'
+    id = Column(String(36), primary_key=True, default=lambda: str(uuid.uuid4()))
+    tenant_id = Column(String(255), nullable=False, index=True)
+    timestamp = Column(String(100), nullable=False)
+    provider = Column(String(100))
+    resource_type = Column(String(100))
+    service = Column(String(100))
+    level = Column(String(50))
+    message = Column(Text)
+    latency_ms = Column(String(50), nullable=True)
+    status_code = Column(Integer, nullable=True)
+    request_id = Column(String(255), nullable=True)
+    cluster_id = Column(String(255), nullable=True)
+    resource_id = Column(String(255), nullable=True)
+
+class Deployment(Base):
+    __tablename__ = 'nexus_deployments'
+    id = Column(String(36), primary_key=True, default=lambda: str(uuid.uuid4()))
+    tenant_id = Column(String(255), nullable=False, index=True)
+    timestamp = Column(String(100), nullable=False)
+    commit_sha = Column(String(255))
+    commit_msg = Column(Text)
+    author = Column(String(255))
+    repository = Column(String(255))
+    workflow_run_id = Column(String(255), nullable=True)
+    pr_url = Column(String(1024), nullable=True)
+
+class ChatHistory(Base):
+    __tablename__ = 'nexus_chat_history'
+    id = Column(String(36), primary_key=True, default=lambda: str(uuid.uuid4()))
+    tenant_id = Column(String(255), nullable=False, index=True)
+    timestamp = Column(String(100), nullable=False)
+    session_id = Column(String(255), nullable=False)
+    role = Column(String(50))
+    content = Column(Text)
+    image_base64 = Column(Text, nullable=True)
+    title = Column(String(255), nullable=True)
+
+class PredictiveRisk(Base):
+    __tablename__ = 'nexus_predictive_risks'
+    id = Column(String(36), primary_key=True, default=lambda: str(uuid.uuid4()))
+    tenant_id = Column(String(255), nullable=False, index=True)
+    timestamp = Column(String(100), nullable=False)
+    provider = Column(String(100))
+    resource_type = Column(String(100))
+    resource_name = Column(String(255))
+    risk_score = Column(Float)
+    confidence_score = Column(Float)
+    ettf_minutes = Column(Integer, nullable=True)
+    analysis = Column(Text)
+    recommendation = Column(Text)
+
+engine = None
+SessionLocal = None
+
+def init_pg_db():
+    global engine, SessionLocal
+    if not DATABASE_URL:
+        print("Warning: DATABASE_URL not set. PostgreSQL storage will not be available.")
+        return
+    try:
+        engine = create_engine(DATABASE_URL, pool_pre_ping=True)
+        Base.metadata.create_all(bind=engine)
+        SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
+        print("PostgreSQL tables initialized successfully.")
+    except Exception as e:
+        print(f"Failed to initialize PostgreSQL DB: {e}")
+
+def get_db():
+    if not SessionLocal:
+        yield None
+        return
+    db = SessionLocal()
+    try:
+        yield db
+    finally:
+        db.close()

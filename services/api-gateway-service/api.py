@@ -1,0 +1,2787 @@
+from fastapi import FastAPI, HTTPException, Depends, Security, BackgroundTasks
+from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
+from pydantic import BaseModel
+import uvicorn
+from rag.rag_engine import LogRageEngine
+from typing import Optional, List, Dict
+import jwt
+import datetime
+import hashlib
+import random
+import time
+from passlib.context import CryptContext
+import uuid
+import boto3
+from boto3.dynamodb.conditions import Key
+import requests
+import httpx
+
+from database import (
+    init_dynamodb, get_users_table, get_keys_table, get_incidents_table, get_logs_table,
+    get_deployments_table, store_log, get_logs as db_get_logs, update_reliability_score, get_reliability_score,
+    store_deployment, get_latest_deployment,
+    store_chat_message, get_chat_history, get_chat_sessions, delete_chat_history,
+    get_chat_history_table, get_predictive_risks,
+    update_user_integrations, get_user_integrations
+)
+import notifications
+from predictive_engine import PredictiveEngine
+from pg_database import init_pg_db, get_db, Artifact
+from storage import init_storage, upload_artifact_blob, download_artifact_blob
+
+# Initialize Predictive Engine
+predictive_engine = PredictiveEngine()
+
+# Initialize tables if they don't exist
+try:
+    init_dynamodb()
+except Exception as e:
+    print("Warning: Could not initialize DynamoDB tables (are AWS credentials set?):", e)
+
+# Initialize PostgreSQL and Blob Storage
+init_pg_db()
+init_storage()
+
+app = FastAPI(
+    title="NexusAI SaaS API",
+    description="Multi-tenant SaaS API with DynamoDB Backend",
+    version="3.0.0"
+)
+
+@app.get("/health")
+def health_check():
+    return {"status": "ok"}
+
+engine = LogRageEngine()
+pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
+security = HTTPBearer()
+
+import os
+JWT_SECRET = os.environ.get("JWT_SECRET", "fallback_dev_secret_only")
+
+def get_password_hash(password: str) -> str:
+    return pwd_context.hash(password)
+
+def verify_password(plain_password: str, hashed_password: str) -> bool:
+    return pwd_context.verify(plain_password, hashed_password)
+
+# --- Models ---
+class UserAuth(BaseModel):
+    email: str
+    password: str
+    full_name: Optional[str] = None
+    otp_code: Optional[str] = None
+
+class OTPRequest(BaseModel):
+    email: str
+    full_name: str
+
+# In-memory OTP store: {email: {"otp": "123456", "full_name": "John", "expires": timestamp}}
+otp_store: dict = {}
+
+class ChatRequest(BaseModel):
+    message: str
+    image_base64: Optional[str] = None
+    session_id: Optional[str] = None
+
+class ChatResponse(BaseModel):
+    answer: str
+    session_id: str
+
+class ApiKeyResponse(BaseModel):
+    key: str
+    name: str
+
+# --- OTP Endpoint ---
+@app.post("/api/request-otp", status_code=202)
+def request_otp(req: OTPRequest):
+    """Generate and queue a 6-digit OTP for email verification via Service Bus."""
+    # Check if email already registered
+    users_table = get_users_table()
+    existing = users_table.get_item(Key={'email': req.email})
+    if 'Item' in existing:
+        raise HTTPException(status_code=400, detail="Email already registered")
+
+    otp_code = str(random.randint(100000, 999999))
+    expires_at = time.time() + 120
+    otp_store[req.email] = {
+        "otp": otp_code,
+        "full_name": req.full_name,
+        "expires": expires_at  # 2-minute TTL
+    }
+
+    if os.getenv("DEBUG_LOG_OTP", "false").lower() == "true":
+        print(f"[DEV-ONLY] Generated OTP for {req.email}: {otp_code}")
+
+    sb_fqdn = os.getenv("SERVICE_BUS_FQDN")
+    sb_queue = os.getenv("SERVICE_BUS_QUEUE_NAME", "notification-requested")
+
+    if not sb_fqdn:
+        print("Warning: SERVICE_BUS_FQDN not set, skipping Service Bus publish")
+        return {"message": f"OTP requested for {req.email}. (Service Bus not configured)"}
+
+    try:
+        from azure.servicebus import ServiceBusClient, ServiceBusMessage
+        from azure.identity import DefaultAzureCredential
+        import json
+
+        credential = DefaultAzureCredential()
+        with ServiceBusClient(sb_fqdn, credential=credential) as client:
+            with client.get_queue_sender(sb_queue) as sender:
+                msg_payload = {
+                    "type": "otp",
+                    "email": req.email,
+                    "full_name": req.full_name,
+                    "otp_code": otp_code,
+                    "correlation_id": str(uuid.uuid4()),
+                    "created_at": time.time(),
+                    "expires_at": expires_at
+                }
+                message = ServiceBusMessage(json.dumps(msg_payload))
+                sender.send_messages(message)
+                print(f"Successfully queued OTP notification for {req.email} to {sb_queue}")
+
+    except Exception as e:
+        print(f"Failed to publish OTP to Service Bus: {e}")
+        # Remove from store since it failed
+        del otp_store[req.email]
+        raise HTTPException(
+            status_code=503,
+            detail={
+                "status": "service_bus_publish_failed",
+                "message": "Failed to queue OTP notification. Service unavailable."
+            }
+        )
+
+    return {"message": f"OTP queued for {req.email}. Please check your inbox."}
+
+# --- Auth Endpoints (DynamoDB) ---
+@app.post("/api/register")
+def register_user(user: UserAuth):
+    try:
+        # Validate OTP first
+        if not user.otp_code:
+            raise HTTPException(status_code=400, detail="OTP code is required")
+
+        stored = otp_store.get(user.email)
+        if not stored:
+            raise HTTPException(status_code=400, detail="No OTP found for this email. Please request one first.")
+        if time.time() > stored["expires"]:
+            del otp_store[user.email]
+            raise HTTPException(status_code=400, detail="OTP expired. Please request a new one.")
+        if stored["otp"] != user.otp_code:
+            raise HTTPException(status_code=400, detail="Invalid OTP code.")
+
+        full_name = user.full_name or stored.get("full_name", "")
+        # Clear OTP after successful validation
+        del otp_store[user.email]
+
+        users_table = get_users_table()
+        
+        # Check if user exists but preserve integrations if they are re-registering after auth cleanup
+        response = users_table.get_item(Key={'email': user.email})
+        existing_item = response.get('Item')
+        
+        if existing_item and existing_item.get('hashed_password'):
+            raise HTTPException(status_code=400, detail="Email already registered")
+        
+        integrations = existing_item.get('integrations') if existing_item else None
+        
+        hashed_password = get_password_hash(user.password)
+        user_id = str(uuid.uuid4())
+
+        # Save user with full_name and preserve integrations
+        item_to_put = {
+            'email': user.email,
+            'user_id': user_id,
+            'full_name': full_name,
+            'hashed_password': hashed_password,
+            'created_at': datetime.datetime.utcnow().isoformat()
+        }
+        if integrations:
+            item_to_put['integrations'] = integrations
+            
+        users_table.put_item(Item=item_to_put)
+        # Generate default API key
+        keys_table = get_keys_table()
+        default_key = "nx_live_" + str(uuid.uuid4()).replace("-", "")
+        keys_table.put_item(Item={
+            'api_key': default_key,
+            'user_id': user_id,
+            'email': user.email,
+            'name': "Default Integration Key",
+            'is_active': True,
+            'created_at': datetime.datetime.utcnow().isoformat()
+        })
+        
+        return {"message": "User registered successfully"}
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Database Error: {str(e)}")
+
+@app.post("/api/login")
+def login_user(user: UserAuth):
+    try:
+        users_table = get_users_table()
+        response = users_table.get_item(Key={'email': user.email})
+        
+        if 'Item' not in response:
+            raise HTTPException(status_code=401, detail="Invalid credentials")
+            
+        db_user = response['Item']
+        hashed_password = db_user.get('hashed_password')
+        
+        if not hashed_password or not verify_password(user.password, hashed_password):
+            raise HTTPException(status_code=401, detail="Invalid credentials")
+        
+        token = jwt.encode({
+            "user_id": db_user['user_id'],
+            "email": db_user['email'],
+            "full_name": db_user.get('full_name', ''),
+            "exp": datetime.datetime.utcnow() + datetime.timedelta(hours=24)
+        }, JWT_SECRET, algorithm="HS256")
+        
+        return {"token": token}
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Database Error: {str(e)}")
+
+# --- Protected API Key Endpoints (DynamoDB) ---
+def get_current_user(credentials: HTTPAuthorizationCredentials = Depends(security)):
+    try:
+        payload = jwt.decode(credentials.credentials, JWT_SECRET, algorithms=["HS256"])
+        return payload  # Contains user_id and email
+    except jwt.ExpiredSignatureError:
+        raise HTTPException(status_code=401, detail="Token expired")
+    except jwt.InvalidTokenError:
+        raise HTTPException(status_code=401, detail="Invalid token")
+
+@app.get("/api/keys", response_model=List[ApiKeyResponse])
+def get_api_keys(current_user: dict = Depends(get_current_user)):
+    keys_table = get_keys_table()
+    user_id = current_user.get("user_id")
+    
+    response = keys_table.query(
+        IndexName='UserIdIndex',
+        KeyConditionExpression=Key('user_id').eq(user_id)
+    )
+    
+    keys = response.get('Items', [])
+    return [{"key": k['api_key'], "name": k.get('name', 'Key')} for k in keys if k.get('is_active', True)]
+
+@app.post("/api/keys/generate", response_model=ApiKeyResponse)
+def generate_api_key(current_user: dict = Depends(get_current_user)):
+    keys_table = get_keys_table()
+    new_key_str = "nx_live_" + str(uuid.uuid4()).replace("-", "")
+    key_name = f"Key {datetime.datetime.now().strftime('%Y-%m-%d %H:%M')}"
+    
+    keys_table.put_item(Item={
+        'api_key': new_key_str,
+        'user_id': current_user.get("user_id"),
+        'email': current_user.get("email"),
+        'name': key_name,
+        'is_active': True,
+        'created_at': datetime.datetime.utcnow().isoformat()
+    })
+    
+    return {"key": new_key_str, "name": key_name}
+
+# --- Core Bot Endpoint (Secured via API Key in DynamoDB) ---
+def verify_api_key(credentials: HTTPAuthorizationCredentials = Depends(security)):
+    api_key = credentials.credentials
+    keys_table = get_keys_table()
+    
+    response = keys_table.get_item(Key={'api_key': api_key})
+    if 'Item' not in response or not response['Item'].get('is_active', True):
+        raise HTTPException(status_code=401, detail="Invalid or revoked API Key")
+        
+    return response['Item']
+
+@app.post("/api/chat", response_model=ChatResponse)
+async def chat_endpoint(request: ChatRequest, current_user: dict = Depends(get_current_user)):
+    try:
+        tenant_id = current_user.get("user_id")
+        tenant_email = current_user.get("email")
+        session_id = request.session_id if request.session_id else str(uuid.uuid4())
+        
+        # 1. Store User Message
+        store_chat_message(
+            tenant_id=tenant_id,
+            session_id=session_id,
+            role="user",
+            content=request.message,
+            image_base64=request.image_base64
+        )
+        
+        # 2. Fetch cloud logs if any
+        cloud_logs = get_cloud_logs(current_user)
+        cloud_logs_str = None
+        if cloud_logs:
+            cloud_logs_str = "\n".join([f"[{l['timestamp']}] {l['resource_id']} - {l['level']}: {l['message']}" for l in cloud_logs])
+            
+        result = engine.run_query(
+            query=request.message,
+            time_window_mins=30,
+            image_base64=request.image_base64,
+            cloud_logs_str=cloud_logs_str,
+            tenant_email=tenant_email
+        )
+        
+        answer = result.get("answer", "")
+        
+        # Save assistant response to history
+        store_chat_message(
+            tenant_id=tenant_id,
+            session_id=session_id,
+            role="assistant",
+            content=answer
+        )
+        
+        return ChatResponse(
+            answer=answer,
+            session_id=session_id
+        )
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.get("/api/chat/history")
+def get_chat_history_endpoint(session_id: Optional[str] = None, current_user: dict = Depends(get_current_user)):
+    try:
+        tenant_id = current_user.get("user_id")
+        return get_chat_history(tenant_id, session_id=session_id)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.get("/api/chat/sessions")
+def get_chat_sessions_endpoint(current_user: dict = Depends(get_current_user)):
+    try:
+        tenant_id = current_user.get("user_id")
+        return get_chat_sessions(tenant_id)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.delete("/api/chat/history")
+def delete_chat_history_endpoint(session_id: Optional[str] = None, current_user: dict = Depends(get_current_user)):
+    try:
+        tenant_id = current_user.get("user_id")
+        delete_chat_history(tenant_id, session_id=session_id)
+        return {"status": "success", "message": "Chat history deleted."}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+class SessionRenameRequest(BaseModel):
+    title: str
+
+@app.patch("/api/v1/chat/sessions/{session_id}")
+def rename_chat_session(session_id: str, req: SessionRenameRequest, current_user: dict = Depends(get_current_user)):
+    """Rename a chat session title for the authenticated user."""
+    try:
+        tenant_id = current_user.get("user_id")
+        table = get_chat_history_table()
+        # Update all messages in the session with the new title stored as metadata
+        # We store the title in a special "session_meta" record to avoid scanning all messages
+        timestamp = datetime.datetime.utcnow().isoformat() + "Z"
+        table.put_item(Item={
+            "tenant_id": tenant_id,
+            "timestamp": f"META#{session_id}",
+            "session_id": session_id,
+            "role": "_meta",
+            "content": "",
+            "title": req.title[:100],
+            "updated_at": timestamp
+        })
+        return {"status": "success", "session_id": session_id, "title": req.title}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+
+class VoiceRequest(BaseModel):
+    audio_base64: str
+
+@app.post("/api/chat/voice")
+async def chat_voice_endpoint(request: VoiceRequest, current_user: dict = Depends(get_current_user)):
+    try:
+        import speech_recognition as sr
+        import base64
+        import tempfile
+        import os
+        import subprocess
+
+        # Decode base64
+        audio_data = base64.b64decode(request.audio_base64)
+        
+        # Write to temp file (could be webm)
+        with tempfile.NamedTemporaryFile(delete=False, suffix=".webm") as temp_in:
+            temp_in.write(audio_data)
+            temp_in_path = temp_in.name
+            
+        temp_out_path = temp_in_path.replace(".webm", ".wav")
+        
+        # Use ffmpeg to convert to wav (SpeechRecognition requires WAV)
+        try:
+            subprocess.run(["ffmpeg", "-y", "-i", temp_in_path, temp_out_path], check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        except Exception:
+            # Fallback if ffmpeg isn't installed: try reading directly (works if browser sent WAV natively)
+            import shutil
+            shutil.copy(temp_in_path, temp_out_path)
+
+        recognizer = sr.Recognizer()
+        with sr.AudioFile(temp_out_path) as source:
+            audio = recognizer.record(source)
+            
+        text = recognizer.recognize_google(audio)
+        
+        # Cleanup
+        try:
+            os.remove(temp_in_path)
+            os.remove(temp_out_path)
+        except:
+            pass
+            
+        return {"text": text}
+    except sr.UnknownValueError:
+        raise HTTPException(status_code=400, detail="Could not understand audio")
+    except sr.RequestError as e:
+        raise HTTPException(status_code=500, detail=f"Speech recognition service error: {e}")
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+# Removed in-memory SaaS Connection store in favor of DynamoDB get_user_integrations
+
+def fetch_latest_github_deployment(tenant_email: str) -> Optional[dict]:
+    """Fetches the latest commit from the tenant's most recently updated repository using their PAT."""
+    try:
+        tenant_data = get_user_integrations(tenant_email)
+        if not tenant_data.get("github") or not tenant_data["github"].get("connected"):
+            return None # GitHub not connected
+            
+        pat = tenant_data["github"].get("credentials", {}).get("github_token")
+        if not pat:
+            return None
+            
+        headers = {
+            "Authorization": f"Bearer {pat}",
+            "Accept": "application/vnd.github.v3+json"
+        }
+        
+        # 1. Fetch most recently updated repo
+        repos_url = "https://api.github.com/user/repos?sort=updated&per_page=1"
+        repos_res = requests.get(repos_url, headers=headers)
+        if repos_res.status_code != 200:
+            print(f"Failed to fetch repos: {repos_res.text}")
+            return None
+            
+        repos = repos_res.json()
+        if not repos:
+            return None
+            
+        latest_repo = repos[0]
+        repo_full_name = latest_repo["full_name"]
+        
+        # 2. Fetch latest commit from this repo
+        commits_url = f"https://api.github.com/repos/{repo_full_name}/commits?per_page=1"
+        commits_res = requests.get(commits_url, headers=headers)
+        if commits_res.status_code != 200:
+            print(f"Failed to fetch commits: {commits_res.text}")
+            return None
+            
+        commits = commits_res.json()
+        if not commits:
+            return None
+            
+        latest_commit = commits[0]
+        
+        return {
+            "commit_sha": latest_commit["sha"],
+            "commit_msg": latest_commit["commit"]["message"],
+            "author": latest_commit["commit"]["author"]["name"],
+            "repository": repo_full_name,
+            "timestamp": latest_commit["commit"]["author"]["date"],
+            "pr_url": latest_commit["html_url"] # link to commit
+        }
+    except Exception as e:
+        print(f"Error fetching github deployment: {e}")
+        return None
+
+# --- Telemetry Ingress Models ---
+class UniversalEvent(BaseModel):
+    provider: str
+    resource_type: str
+    resource_name: str
+    level: str
+    message: str
+    payload: Optional[dict] = None
+
+class PromGrafanaEvent(BaseModel):
+    alert_name: str
+    status: str
+    labels: dict
+    annotations: dict
+
+class NexusEvent(BaseModel):
+    service: str
+    level: str
+    message: str
+    latency_ms: Optional[float] = None
+    status_code: Optional[int] = None
+    request_id: Optional[str] = None
+    cluster_id: Optional[str] = None
+    resource_id: Optional[str] = None
+
+class GitHubDeploymentEvent(BaseModel):
+    commit_sha: str
+    commit_msg: str
+    author: str
+    repository: str
+    workflow_run_id: Optional[str] = None
+    pr_url: Optional[str] = None
+
+@app.post("/api/v1/github/webhook")
+def github_webhook(event: GitHubDeploymentEvent, current_user: dict = Depends(get_current_user)):
+    """Receives GitHub Deployment and Workflow Run details for telemetry correlation."""
+    try:
+        tenant_id = current_user.get("user_id")
+        timestamp = datetime.datetime.utcnow().isoformat() + "Z"
+        
+        success = store_deployment(
+            tenant_id=tenant_id,
+            timestamp=timestamp,
+            deploy_data={
+                "commit_sha": event.commit_sha,
+                "commit_msg": event.commit_msg,
+                "author": event.author,
+                "repository": event.repository,
+                "workflow_run_id": event.workflow_run_id,
+                "pr_url": event.pr_url
+            }
+        )
+        if not success:
+            raise HTTPException(status_code=500, detail="Failed to store deployment correlation context")
+
+        # Ingest a system log indicating a deployment occurred
+        store_log(
+            tenant_id=tenant_id,
+            timestamp=timestamp,
+            log_data={
+                "service": "github-actions",
+                "level": "INFO",
+                "message": f"Deployment Completed: {event.repository} (Commit: {event.commit_sha[:7]} by {event.author})",
+                "cluster_id": "github",
+                "resource_id": event.workflow_run_id
+            }
+        )
+        return {"status": "success", "message": "GitHub deployment recorded"}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.post("/api/v1/ingest")
+def ingest_telemetry(event: NexusEvent, current_user: dict = Depends(get_current_user)):
+    try:
+        tenant_id = current_user.get("user_id")
+        tenant_email = current_user.get("email")
+        timestamp = datetime.datetime.utcnow().isoformat() + "Z"
+        
+        # Abstraction Layer Log Write (Future proofed repository pattern)
+        store_log(
+            tenant_id=tenant_id,
+            timestamp=timestamp,
+            log_data={
+                "service": event.service,
+                "level": event.level,
+                "message": event.message,
+                "latency_ms": event.latency_ms,
+                "status_code": event.status_code,
+                "request_id": event.request_id,
+                "cluster_id": event.cluster_id,
+                "resource_id": event.resource_id
+            }
+        )
+        
+        is_reactive = event.level.upper() in ["ERROR", "CRITICAL", "FATAL"]
+
+        if is_reactive:
+            # --- 1. Reactive Pipeline ---
+            # Update Reliability Score (Deduct 5.0 points)
+            current_score = get_reliability_score(tenant_email)
+            update_reliability_score(tenant_email, current_score - 5.0)
+
+            incident_id = f"INC-{uuid.uuid4().hex[:8].upper()}"
+            incidents_table = get_incidents_table()
+            incidents_table.put_item(Item={
+                'tenant_id': tenant_id,
+                'incident_id': incident_id,
+                'status': 'OPEN',
+                'severity': event.level.upper(),
+                'service': event.service,
+                'created_at': timestamp,
+                'rca_report': ''
+            })
+            
+            # Dispatch email using the Notification Framework
+            notifications.notify_incident_created(
+                tenant_email=tenant_email,
+                incident_id=incident_id,
+                service=event.service,
+                severity=event.level.upper(),
+                full_name=current_user.get("full_name", "")
+            )
+        else:
+            # --- 2. Predictive Pipeline ---
+            # Fetch recent logs for analyzing trends
+            recent_logs = db_get_logs(tenant_id, limit=50)
+            
+            # Evaluate using predictive heuristics
+            is_anomaly, prediction = predictive_engine.analyze_logs_and_predict(recent_logs)
+            if is_anomaly and prediction:
+                # Update Reliability Score (Deduct 2.0 points for proactive threat)
+                current_score = get_reliability_score(tenant_email)
+                update_reliability_score(tenant_email, current_score - 2.0)
+
+                # Correlate with recent GitHub Deployment using PAT
+                latest_deploy = fetch_latest_github_deployment(tenant_email)
+                if not latest_deploy:
+                    # Fallback to webhooks if available
+                    latest_deploy = get_latest_deployment(tenant_id)
+
+                # Generate AI-assisted Predictive RCA
+                rca_details = predictive_engine.generate_predictive_rca(prediction, latest_deploy)
+                
+                # Combine predictive alerts & trigger notification
+                notifications.notify_predictive_alert(
+                    tenant_email=tenant_email,
+                    service=prediction["service"],
+                    failure_type=prediction["failure_type"],
+                    risk_score=prediction["risk_score"],
+                    confidence_score=prediction["confidence_score"],
+                    probable_cause=rca_details["probable_cause"],
+                    suggested_remediation=rca_details["suggested_remediation"],
+                    deployment_context=latest_deploy,
+                    full_name=current_user.get("full_name", "")
+                )
+            
+        return {"status": "success", "message": "Log ingested and processed"}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Ingest Error: {str(e)}")
+
+@app.get("/api/v1/reliability")
+def get_reliability(current_user: dict = Depends(get_current_user)):
+    """Retrieves the current reliability score for the tenant."""
+    try:
+        tenant_email = current_user.get("email")
+        score = get_reliability_score(tenant_email)
+        return {"reliability_score": score}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.get("/api/v1/logs")
+def get_logs(current_user: dict = Depends(get_current_user)):
+    try:
+        tenant_id = current_user.get("user_id")
+        logs_table = get_logs_table()
+        
+        response = logs_table.query(
+            KeyConditionExpression=Key('tenant_id').eq(tenant_id),
+            ScanIndexForward=False, # Get newest first
+            Limit=50
+        )
+        return response.get('Items', [])
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.post("/api/v1/telemetry/universal")
+def ingest_universal_telemetry(event: UniversalEvent, current_user: dict = Depends(get_current_user)):
+    try:
+        tenant_id = current_user.get("user_id")
+        timestamp = datetime.datetime.utcnow().isoformat() + "Z"
+        
+        store_log(
+            tenant_id=tenant_id,
+            timestamp=timestamp,
+            log_data={
+                "provider": event.provider,
+                "resource_type": event.resource_type,
+                "service": event.resource_name,
+                "level": event.level,
+                "message": event.message
+            }
+        )
+        return {"status": "success", "message": "Universal telemetry ingested"}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.post("/api/v1/integrations/prom-grafana")
+def ingest_prom_grafana(event: PromGrafanaEvent, current_user: dict = Depends(get_current_user)):
+    try:
+        tenant_id = current_user.get("user_id")
+        timestamp = datetime.datetime.utcnow().isoformat() + "Z"
+        
+        level = "ERROR" if event.status == "firing" else "INFO"
+        
+        store_log(
+            tenant_id=tenant_id,
+            timestamp=timestamp,
+            log_data={
+                "provider": "observability",
+                "resource_type": "prometheus",
+                "service": event.labels.get("service", "unknown"),
+                "level": level,
+                "message": event.annotations.get("description", event.alert_name)
+            }
+        )
+        return {"status": "success", "message": "Prometheus/Grafana alert processed"}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.get("/api/v1/incidents/predictive")
+def get_predictive_incidents(current_user: dict = Depends(get_current_user)):
+    try:
+        tenant_id = current_user.get("user_id")
+        risks = get_predictive_risks(tenant_id)
+        return risks
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+# --- Incident Management ---
+@app.get("/api/v1/incidents")
+def get_incidents(current_user: dict = Depends(get_current_user)):
+    try:
+        tenant_id = current_user.get("user_id")
+        incidents_table = get_incidents_table()
+        
+        response = incidents_table.query(
+            KeyConditionExpression=Key('tenant_id').eq(tenant_id)
+        )
+        return response.get('Items', [])
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.post("/api/v1/incidents/{incident_id}/rca")
+def generate_incident_rca(incident_id: str, current_user: dict = Depends(get_current_user)):
+    try:
+        tenant_id = current_user.get("user_id")
+        incidents_table = get_incidents_table()
+        
+        # Verify incident belongs to tenant
+        response = incidents_table.get_item(Key={'tenant_id': tenant_id, 'incident_id': incident_id})
+        if 'Item' not in response:
+            raise HTTPException(status_code=404, detail="Incident not found")
+            
+        incident = response['Item']
+        
+        # Trigger actual RCA generation (using the RAG engine)
+        rca_query = f"Generate a Root Cause Analysis for incident {incident_id} affecting {incident.get('service')}. Look for recent errors in the logs."
+        rca_result = engine.run_query(rca_query, time_window_mins=60)
+        rca_report = rca_result.get("answer", "No RCA could be generated.")
+        
+        # Update Database
+        incidents_table.update_item(
+            Key={'tenant_id': tenant_id, 'incident_id': incident_id},
+            UpdateExpression="SET rca_report = :rca, #st = :st",
+            ExpressionAttributeNames={"#st": "status"},
+            ExpressionAttributeValues={":rca": rca_report, ":st": "ANALYZED"}
+        )
+        
+        # Send RCA Email
+        notifications.notify_rca_completed(
+            tenant_email=current_user.get("email"),
+            incident_id=incident_id,
+            service=incident.get("service"),
+            rca_report=rca_report
+        )
+        
+        return {"status": "success", "incident_id": incident_id, "rca_report": rca_report}
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+github_deployments_cache = {}
+github_repo_workflow_cache = {}
+notified_failed_workflows = set()
+
+def auto_diagnose_and_notify_pipeline(current_user: dict, pat: str, repo_name: str, workflow_run_id: str):
+    """Background task to diagnose pipeline failure and send email."""
+    try:
+        headers = {"Authorization": f"Bearer {pat}", "Accept": "application/vnd.github.v3+json"}
+        jobs_url = f"https://api.github.com/repos/{repo_name}/actions/runs/{workflow_run_id}/jobs"
+        jobs_res = requests.get(jobs_url, headers=headers)
+        if jobs_res.status_code != 200: return
+            
+        jobs = jobs_res.json().get("jobs", [])
+        failed_job = next((job for job in jobs if job.get("conclusion") == "failure"), None)
+        if not failed_job: return
+            
+        job_id = failed_job["id"]
+        logs_url = f"https://api.github.com/repos/{repo_name}/actions/jobs/{job_id}/logs"
+        logs_res = requests.get(logs_url, headers=headers)
+        if logs_res.status_code != 200: return
+            
+        raw_logs = logs_res.text
+        log_snippet = raw_logs[-3000:]
+        diagnosis_query = f"The GitHub Actions pipeline '{failed_job['name']}' in repository '{repo_name}' failed. Analyze these logs and predict the exact root cause and an accurate solution:\n\n{log_snippet}"
+        
+        ai_result = engine.run_query(diagnosis_query, time_window_mins=60)
+        diagnosis = ai_result.get("answer", "Analysis failed.")
+        
+        # Send Email
+        notifications.notify_pipeline_failure(
+            tenant_email=current_user.get("email"),
+            repository=repo_name,
+            job_name=failed_job["name"],
+            raw_logs=log_snippet,
+            ai_diagnosis=diagnosis,
+            full_name=current_user.get("full_name", "")
+        )
+    except Exception as e:
+        print(f"Background diagnostic error: {e}")
+
+
+@app.get("/api/v1/github/deployments")
+def get_github_deployments(background_tasks: BackgroundTasks, current_user: dict = Depends(get_current_user)):
+    """Retrieves deployment logs for the authenticated tenant."""
+    try:
+        tenant_id = current_user.get("user_id")
+        
+        # Check cache
+        current_time = time.time()
+        cache_key = f"github_deployments_{tenant_id}"
+        if cache_key in github_deployments_cache:
+            cache_entry = github_deployments_cache[cache_key]
+            if current_time - cache_entry['time'] < 10:  # 10 second TTL
+                return cache_entry['data']
+
+        table = get_deployments_table()
+        response = table.query(
+            KeyConditionExpression=Key('tenant_id').eq(tenant_id),
+            ScanIndexForward=False,
+            Limit=50
+        )
+        db_items = response.get('Items', [])
+        
+        # Merge live deployments from PAT if available
+        tenant_data = get_user_integrations(current_user.get("email"))
+        pat = tenant_data.get("github", {}).get("credentials", {}).get("github_token")
+        
+        if pat:
+            headers = {"Authorization": f"Bearer {pat}", "Accept": "application/vnd.github.v3+json"}
+            repos = []
+            
+            # 1. All accessible repositories
+            owner_res = requests.get("https://api.github.com/user/repos?sort=updated&per_page=100&affiliation=owner,collaborator,organization_member", headers=headers, timeout=5)
+            if owner_res.status_code == 200:
+                repos.extend(owner_res.json())
+                
+            if repos:
+                import concurrent.futures
+
+                def fetch_repo_data(repo):
+                    repo_name = repo.get("full_name")
+                    if not repo_name: return None
+                    repo_updated_at = repo.get("updated_at", "")
+                    cache_key_repo = f"{tenant_id}_{repo_name}"
+                    
+                    # Check smart per-repo cache
+                    if cache_key_repo in github_repo_workflow_cache:
+                        cached_entry = github_repo_workflow_cache[cache_key_repo]
+                        if cached_entry["updated_at"] == repo_updated_at:
+                            return cached_entry["db_items"]
+
+                    repo_items = []
+                    try:
+                        runs_url = f"https://api.github.com/repos/{repo_name}/actions/runs?per_page=15"
+                        runs_res = requests.get(runs_url, headers=headers, timeout=3)
+                        if runs_res.status_code == 200:
+                            runs_data = runs_res.json()
+                            runs = runs_data.get("workflow_runs", [])
+                            
+                            if runs:
+                                run = runs[0]
+                                repo_items.append({
+                                    "commit_sha": run.get("head_sha", ""),
+                                    "commit_msg": (run.get("head_commit") or {}).get("message", "Commit"),
+                                    "author": ((run.get("head_commit") or {}).get("author") or {}).get("name", "Unknown"),
+                                    "repository": repo_name,
+                                    "workflow_name": run.get("name", "Pipeline"),
+                                    "timestamp": run.get("updated_at") or run.get("created_at") or "",
+                                    "workflow_run_id": str(run.get("id", "")),
+                                    "status": run.get("status"),
+                                    "conclusion": run.get("conclusion")
+                                })
+                            
+                            if not repo_items:
+                                # Fallback to commit if no workflow runs exist
+                                commits_url = f"https://api.github.com/repos/{repo_name}/commits?per_page=1"
+                                commits_res = requests.get(commits_url, headers=headers, timeout=3)
+                                if commits_res.status_code == 200:
+                                    commits = commits_res.json()
+                                    if commits and isinstance(commits, list) and len(commits) > 0:
+                                        commit = commits[0]
+                                        repo_items.append({
+                                            "commit_sha": commit.get("sha", ""),
+                                            "commit_msg": (commit.get("commit") or {}).get("message", "Commit"),
+                                            "author": ((commit.get("commit") or {}).get("author") or {}).get("name", "Unknown"),
+                                            "repository": repo_name,
+                                            "workflow_name": "Source Sync",
+                                            "timestamp": ((commit.get("commit") or {}).get("author") or {}).get("date", ""),
+                                            "workflow_run_id": "PAT_SYNC",
+                                            "status": "completed",
+                                            "conclusion": "success"
+                                        })
+                    except requests.exceptions.RequestException:
+                        pass
+                    
+                    if not repo_items:
+                        repo_items.append({
+                            "commit_sha": "N/A",
+                            "commit_msg": "No pipeline data or repository is empty.",
+                            "author": "-",
+                            "repository": repo_name,
+                            "workflow_name": "No Pipelines",
+                            "timestamp": repo_updated_at,
+                            "workflow_run_id": "PAT_SYNC",
+                            "status": "completed",
+                            "conclusion": "success"
+                        })
+                    
+                    github_repo_workflow_cache[cache_key_repo] = {
+                        "updated_at": repo_updated_at,
+                        "db_items": repo_items
+                    }
+                    return repo_items
+
+                with concurrent.futures.ThreadPoolExecutor(max_workers=10) as executor:
+                    results = executor.map(fetch_repo_data, repos)
+                    for items in results:
+                        if items:
+                            for item in items:
+                                db_items.append(item)
+                                
+                                # Trigger background diagnosis if pipeline failed and hasn't been notified yet
+                                if item.get("conclusion") == "failure" and item.get("workflow_run_id") != "PAT_SYNC":
+                                    run_id = item.get("workflow_run_id")
+                                    if run_id not in notified_failed_workflows:
+                                        notified_failed_workflows.add(run_id)
+                                        background_tasks.add_task(
+                                            auto_diagnose_and_notify_pipeline, 
+                                            current_user, 
+                                            pat, 
+                                            item.get("repository"), 
+                                            run_id
+                                        )
+                            
+        # Sort combined items by timestamp descending
+        db_items.sort(key=lambda x: x.get("timestamp") or "", reverse=True)
+        
+        # Save to main 10s cache
+        github_deployments_cache[cache_key] = {'time': current_time, 'data': db_items}
+        
+        return db_items
+    except Exception as e:
+        import traceback
+        with open("error.log", "w") as f:
+            f.write(traceback.format_exc())
+        raise HTTPException(status_code=500, detail=str(e))
+
+class DiagnoseRequest(BaseModel):
+    repository: str
+    workflow_run_id: str
+
+@app.post("/api/v1/github/diagnose")
+def diagnose_github_pipeline(req: DiagnoseRequest, current_user: dict = Depends(get_current_user)):
+    """Fetches failed workflow logs and generates an AI diagnosis."""
+    try:
+        tenant_email = current_user.get("email")
+        tenant_data = get_user_integrations(tenant_email)
+        pat = tenant_data.get("github", {}).get("credentials", {}).get("github_token")
+        
+        if not pat:
+            raise HTTPException(status_code=400, detail="GitHub PAT not found")
+            
+        headers = {"Authorization": f"Bearer {pat}", "Accept": "application/vnd.github.v3+json"}
+        
+        # 1. Get Jobs for the Workflow Run
+        jobs_url = f"https://api.github.com/repos/{req.repository}/actions/runs/{req.workflow_run_id}/jobs"
+        jobs_res = requests.get(jobs_url, headers=headers)
+        if jobs_res.status_code != 200:
+            raise HTTPException(status_code=400, detail="Failed to fetch jobs for workflow")
+            
+        jobs = jobs_res.json().get("jobs", [])
+        failed_job = next((job for job in jobs if job.get("conclusion") == "failure"), None)
+        
+        if not failed_job:
+            return {"diagnosis": "No failed jobs found in this workflow run."}
+            
+        job_id = failed_job["id"]
+        
+        # 2. Get Logs for the failed Job
+        logs_url = f"https://api.github.com/repos/{req.repository}/actions/jobs/{job_id}/logs"
+        logs_res = requests.get(logs_url, headers=headers)
+        
+        if logs_res.status_code != 200:
+            raise HTTPException(status_code=400, detail="Failed to download job logs. Ensure PAT has 'actions:read' permission.")
+            
+        raw_logs = logs_res.text
+        
+        # 3. Analyze Logs with RAG Engine
+        # Limit logs to last 3000 chars to avoid token limits
+        log_snippet = raw_logs[-3000:]
+        
+        diagnosis_query = f"The GitHub Actions pipeline '{failed_job['name']}' in repository '{req.repository}' failed. Analyze these logs and predict the exact root cause and an accurate solution:\n\n{log_snippet}"
+        
+        ai_result = engine.run_query(diagnosis_query, time_window_mins=60)
+        diagnosis = ai_result.get("answer", "Analysis failed.")
+        
+        return {
+            "status": "success",
+            "job_name": failed_job["name"],
+            "diagnosis": diagnosis,
+            "raw_logs": log_snippet
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+class RunWorkflowRequest(BaseModel):
+    repository: str
+    workflow_id: str
+    branch: str = "main"
+
+@app.post("/api/v1/github/workflows/run")
+def run_github_workflow(req: RunWorkflowRequest, current_user: dict = Depends(get_current_user)):
+    """Triggers a GitHub Actions workflow manually."""
+    try:
+        tenant_email = current_user.get("email")
+        tenant_data = get_user_integrations(tenant_email)
+        pat = tenant_data.get("github", {}).get("credentials", {}).get("github_token")
+        
+        if not pat:
+            raise HTTPException(status_code=400, detail="GitHub PAT not found")
+            
+        headers = {"Authorization": f"Bearer {pat}", "Accept": "application/vnd.github.v3+json"}
+        
+        # Trigger workflow dispatch or rerun
+        if req.workflow_id.isdigit():
+            # Attempt to rerun existing workflow run
+            dispatch_url = f"https://api.github.com/repos/{req.repository}/actions/runs/{req.workflow_id}/rerun"
+            r = requests.post(dispatch_url, headers=headers)
+            
+            # If rerun fails (e.g., >30 days old, or successful run), fallback to dispatching a new run
+            if r.status_code not in [204, 201]:
+                run_info = requests.get(f"https://api.github.com/repos/{req.repository}/actions/runs/{req.workflow_id}", headers=headers)
+                if run_info.status_code == 200:
+                    real_workflow_id = run_info.json().get("workflow_id")
+                    if real_workflow_id:
+                        dispatch_url = f"https://api.github.com/repos/{req.repository}/actions/workflows/{real_workflow_id}/dispatches"
+                        payload = {"ref": req.branch}
+                        r = requests.post(dispatch_url, headers=headers, json=payload)
+        else:
+            dispatch_url = f"https://api.github.com/repos/{req.repository}/actions/workflows/{req.workflow_id}/dispatches"
+            payload = {"ref": req.branch}
+            r = requests.post(dispatch_url, headers=headers, json=payload)
+            
+        if r.status_code not in [204, 201]:
+            raise HTTPException(status_code=400, detail=f"Failed to trigger workflow: {r.text}")
+            
+        return {"status": "success", "message": f"Successfully triggered workflow in {req.repository}"}
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.get("/api/v1/k8s/resources")
+def get_k8s_resources(current_user: dict = Depends(get_current_user)):
+    """Returns cluster nodes, active pods, and deployment states for AKS/EKS dashboard visualization."""
+    try:
+        # Mock telemetry matching Kubernetes schema specifications
+        return {
+            "cluster_id": "aks-prod-cluster-01",
+            "provider": "Azure Kubernetes Service",
+            "region": "us-east-1",
+            "nodes": [
+                {"name": "aks-nodepool1-vm-0", "status": "Ready", "cpu_util": "48%", "mem_util": "62%"},
+                {"name": "aks-nodepool1-vm-1", "status": "Ready", "cpu_util": "35%", "mem_util": "50%"},
+                {"name": "aks-nodepool1-vm-2", "status": "Ready", "cpu_util": "72%", "mem_util": "85%"}
+            ],
+            "pods": [
+                {"name": "payment-api-cf7d685-z8a9s", "namespace": "production", "status": "Running", "restarts": 0, "cpu": "120m", "mem": "240Mi"},
+                {"name": "auth-service-5421c9b-h2n3s", "namespace": "production", "status": "Running", "restarts": 2, "cpu": "80m", "mem": "150Mi"},
+                {"name": "log-collector-flb-8h1n2", "namespace": "kube-system", "status": "Running", "restarts": 0, "cpu": "50m", "mem": "95Mi"},
+                {"name": "notification-worker-6b998-f2nsd", "namespace": "production", "status": "Running", "restarts": 1, "cpu": "110m", "mem": "180Mi"}
+            ],
+            "deployments": [
+                {"name": "payment-api", "desired": 3, "ready": 3, "updated": 3},
+                {"name": "auth-service", "desired": 2, "ready": 2, "updated": 2},
+                {"name": "notification-worker", "desired": 2, "ready": 2, "updated": 2}
+            ]
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.get("/api/v1/metrics")
+def get_service_metrics(current_user: dict = Depends(get_current_user)):
+    """Compiles service-specific telemetry indicators."""
+    try:
+        tenant_id = current_user.get("user_id")
+        logs = db_get_logs(tenant_id, limit=100)
+        
+        # Aggregate heuristics per service
+        metrics = {}
+        for log in logs:
+            srv = log.get("service", "unknown")
+            if srv not in metrics:
+                metrics[srv] = {"latency_sum": 0.0, "latency_count": 0, "warnings": 0, "errors": 0}
+            
+            lvl = log.get("level", "INFO").upper()
+            if lvl == "WARN":
+                metrics[srv]["warnings"] += 1
+            elif lvl in ("ERROR", "CRITICAL", "FATAL"):
+                metrics[srv]["errors"] += 1
+                
+            lat = log.get("latency_ms")
+            if lat:
+                metrics[srv]["latency_sum"] += float(lat)
+                metrics[srv]["latency_count"] += 1
+                
+        results = []
+        for srv, stats in metrics.items():
+            avg_lat = stats["latency_sum"] / stats["latency_count"] if stats["latency_count"] > 0 else 0.0
+            results.append({
+                "service": srv,
+                "avg_latency": round(avg_lat, 2),
+                "warnings": stats["warnings"],
+                "errors": stats["errors"],
+                "health_score": max(0, 100 - (stats["errors"] * 10 + stats["warnings"] * 3))
+            })
+            
+        return results
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+# Removed In-memory SaaS Connection store in favor of DynamoDB
+
+class ConnectionRequest(BaseModel):
+    service: str # "github", "eks", or "aks"
+    connected: bool
+    credentials: Optional[dict] = None
+
+@app.get("/api/v1/integrations")
+def get_integrations(current_user: dict = Depends(get_current_user)):
+    """Retrieves external integration statuses for this tenant workspace."""
+    try:
+        tenant_email = current_user.get("email")
+        integrations = get_user_integrations(tenant_email)
+        
+        status_map = {
+            "github": False, "aws": False, "azure": False,
+            "github_details": None
+        }
+        for k in list(status_map.keys()):
+            if k == "github_details": continue
+            if k in integrations and integrations[k].get("connected"):
+                status_map[k] = True
+                if k == "github":
+                    status_map["github_details"] = integrations[k].get("credentials", {}).get("github_username")
+                
+        return status_map
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.get("/api/v1/aws/status")
+def get_aws_hub_status(current_user: dict = Depends(get_current_user)):
+    """Retrieves the AWS connection status explicitly from the central integrations state."""
+    try:
+        tenant_email = current_user.get("email")
+        integrations = get_user_integrations(tenant_email)
+        
+        aws_data = integrations.get("aws", {})
+        if aws_data and aws_data.get("connected"):
+            return {
+                "connected": True,
+                "provider": "aws",
+                "account_id": aws_data.get("account_id"),
+                "region": aws_data.get("region", "us-east-1"),
+                "auth_method": aws_data.get("auth_method")
+            }
+        
+        return {
+            "connected": False,
+            "message": "AWS is not connected."
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.post("/api/v1/integrations/connect")
+def update_integration_connection(req: ConnectionRequest, current_user: dict = Depends(get_current_user)):
+    """Updates / Saves credentials and toggles connection status for an external service."""
+    import requests
+    try:
+        tenant_email = current_user.get("email")
+        integrations = get_user_integrations(tenant_email)
+        
+        service_key = req.service.lower()
+        if service_key not in integrations:
+            integrations[service_key] = {}
+            
+        if req.connected and service_key == "github" and req.credentials:
+            github_token = req.credentials.get("github_token")
+            github_email = req.credentials.get("github_email")
+            
+            if github_token and github_email:
+                headers = {
+                    "Accept": "application/vnd.github+json",
+                    "X-GitHub-Api-Version": "2022-11-28",
+                    "Authorization": f"token {github_token}"
+                }
+                
+                # Verify emails
+                r_emails = requests.get("https://api.github.com/user/emails", headers=headers, timeout=5)
+                if r_emails.status_code != 200:
+                    raise HTTPException(status_code=400, detail="Invalid GitHub Personal Access Token or missing 'user:email' scope. Please regenerate your PAT with the 'user:email' scope.")
+                
+                emails_data = r_emails.json()
+                verified_emails = [e.get("email").lower() for e in emails_data if e.get("verified")]
+                
+                r_user = requests.get("https://api.github.com/user", headers=headers, timeout=5)
+                if r_user.status_code != 200:
+                    raise HTTPException(status_code=400, detail="Could not determine GitHub account from PAT")
+                
+                user_data = r_user.json()
+                github_login = user_data.get("login")
+                
+                if github_email.lower() not in verified_emails and github_email.lower() != github_login.lower():
+                    raise HTTPException(
+                        status_code=400, 
+                        detail=f"The provided email/username '{github_email}' does not match the GitHub account associated with this PAT. Verified login is '{github_login}'."
+                    )
+                
+                req.credentials["github_username"] = github_login
+
+        if req.connected and service_key == "aws" and req.credentials:
+            # Validate AWS credentials via the AWS Intelligence Service
+            import requests as _requests
+            aws_payload = {
+                "connection_name": req.credentials.get("connection_name", "AWS Connection"),
+                "auth_method": "access_keys" if req.credentials.get("access_key_id") else "environment",
+                "access_key_id": req.credentials.get("access_key_id"),
+                "secret_access_key": req.credentials.get("secret_access_key"),
+                "session_token": req.credentials.get("session_token"),
+                "default_region": req.credentials.get("region", "us-east-1"),
+                "region": req.credentials.get("region", "us-east-1")
+            }
+            try:
+                _aws_svc_url = os.getenv("AWS_INTELLIGENCE_SERVICE_URL", "http://aws-intelligence-service:8000")
+                aws_res = _requests.post(f"{_aws_svc_url}/api/v1/aws/connect", json=aws_payload, timeout=10)
+                if aws_res.status_code != 200:
+                    detail = aws_res.json().get("detail", "AWS credentials could not be validated.") if aws_res.headers.get("content-type", "").startswith("application/json") else "AWS credentials could not be validated."
+                    raise HTTPException(status_code=400, detail=detail)
+                aws_result = aws_res.json()
+                # Read account_id from root or connection_details
+                aws_account_id = aws_result.get("account_id") or aws_result.get("connection_details", {}).get("account_id")
+                aws_region = req.credentials.get("region", "us-east-1")
+                aws_auth_method = aws_payload["auth_method"]
+            except HTTPException:
+                raise
+            except _requests.exceptions.RequestException as e:
+                raise HTTPException(status_code=500, detail=f"Could not reach AWS Intelligence service: {str(e)}")
+
+            # Save full AWS integration metadata
+            integrations["aws"] = {
+                "connected": True,
+                "validated": True,
+                "provider": "aws",
+                "account_id": aws_account_id,
+                "region": aws_region,
+                "auth_method": aws_auth_method,
+                "credentials": req.credentials,
+                "validated_at": datetime.datetime.utcnow().isoformat() + "Z"
+            }
+            update_user_integrations(tenant_email, integrations)
+
+            status_map = {
+                "github": False, "aws": True, "azure": False,
+                "github_details": None
+            }
+            for k in ["github", "azure"]:
+                if k in integrations and integrations[k].get("connected"):
+                    status_map[k] = True
+                    if k == "github":
+                        status_map["github_details"] = integrations[k].get("credentials", {}).get("github_username")
+            return {"status": "success", "message": "AWS connection status updated", "integrations": status_map}
+
+        if req.connected and service_key == "azure" and req.credentials:
+            from azure.identity import ClientSecretCredential
+            from azure.mgmt.subscription import SubscriptionClient
+            import azure.core.exceptions
+
+            client_id = req.credentials.get("client_id")
+            client_secret = req.credentials.get("client_secret")
+            azure_tenant = req.credentials.get("tenant_id")
+
+            if client_id and client_secret and azure_tenant:
+                try:
+                    credential = ClientSecretCredential(
+                        tenant_id=azure_tenant,
+                        client_id=client_id,
+                        client_secret=client_secret
+                    )
+                    
+                    # Verify by fetching subscriptions
+                    sub_client = SubscriptionClient(credential)
+                    subs = list(sub_client.subscriptions.list())
+                    if not subs:
+                        raise HTTPException(status_code=400, detail="Authenticated successfully, but no Azure subscriptions found for this Tenant.")
+                except azure.core.exceptions.ClientAuthenticationError as auth_err:
+                    raise HTTPException(status_code=400, detail=f"Azure Authentication Failed: {auth_err.message}")
+                except Exception as ex:
+                    if isinstance(ex, HTTPException):
+                        raise ex
+                    raise HTTPException(status_code=400, detail=f"Could not verify Azure credentials: {str(ex)}")
+
+        integrations[service_key]["connected"] = req.connected
+        if req.credentials:
+            integrations[service_key]["credentials"] = req.credentials
+            
+        update_user_integrations(tenant_email, integrations)
+        
+        status_map = {
+            "github": False, "aws": False, "azure": False,
+            "github_details": None
+        }
+        for k in list(status_map.keys()):
+            if k == "github_details": continue
+            if k in integrations and integrations[k].get("connected"):
+                status_map[k] = True
+                if k == "github":
+                    status_map["github_details"] = integrations[k].get("credentials", {}).get("github_username")
+                
+        return {"status": "success", "message": f"{req.service} connection status updated", "integrations": status_map}
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+import requests
+
+@app.get("/api/v1/github/workflow_status/{owner}/{repo}/{run_id}")
+def get_github_workflow_live_status(owner: str, repo: str, run_id: str, current_user: dict = Depends(get_current_user)):
+    """Fetches real-time workflow jobs and steps using tenant's stored GitHub credentials."""
+    try:
+        tenant_email = current_user.get("email")
+        integrations = get_user_integrations(tenant_email)
+        
+        if "github" not in integrations or not integrations["github"].get("connected"):
+            raise HTTPException(status_code=400, detail="GitHub integration not connected")
+            
+        creds = integrations["github"].get("credentials", {})
+        github_token = creds.get("github_token")
+        
+        if not github_token:
+            raise HTTPException(status_code=400, detail="GitHub credentials incomplete")
+            
+        headers = {
+            "Accept": "application/vnd.github+json",
+            "X-GitHub-Api-Version": "2022-11-28",
+            "Authorization": f"token {github_token}"
+        }
+        
+        repo_fullname = f"{owner}/{repo}"
+        
+        # 1. Fetch Run details
+        run_url = f"https://api.github.com/repos/{repo_fullname}/actions/runs/{run_id}"
+        run_res = requests.get(run_url, headers=headers, timeout=5)
+        if run_res.status_code != 200:
+            raise HTTPException(status_code=502, detail=f"Failed to fetch run from GitHub: {run_res.text}")
+        run_data = run_res.json()
+        
+        # 2. Fetch Jobs
+        jobs_url = f"https://api.github.com/repos/{repo_fullname}/actions/runs/{run_id}/jobs"
+        jr = requests.get(jobs_url, headers=headers, timeout=5)
+        jobs_data = {}
+        if jr.status_code == 200:
+            jobs_data = jr.json()
+            
+        jobs = []
+        for j in jobs_data.get("jobs", []):
+            jobs.append({
+                "id": j.get("id"),
+                "name": j.get("name"),
+                "status": j.get("status"),
+                "conclusion": j.get("conclusion"),
+                "started_at": j.get("started_at"),
+                "completed_at": j.get("completed_at"),
+                "html_url": j.get("html_url"),
+                "steps": [{"name": s.get("name"), "status": s.get("status"), "conclusion": s.get("conclusion")} for s in j.get("steps", [])]
+            })
+            
+        result = {
+            "source": "api",
+            "repo": repo_fullname,
+            "run_id": run_id,
+            "run_number": run_data.get("run_number"),
+            "name": run_data.get("name"),
+            "status": run_data.get("status"),
+            "conclusion": run_data.get("conclusion"),
+            "html_url": run_data.get("html_url"),
+            "event": run_data.get("event"),
+            "head_branch": run_data.get("head_branch"),
+            "head_commit_message": run_data.get("head_commit", {}).get("message", "No message"),
+            "head_sha": run_data.get("head_sha"),
+            "actor": run_data.get("triggering_actor", {}).get("login", run_data.get("actor", {}).get("login", "unknown")),
+            "created_at": run_data.get("created_at"),
+            "updated_at": run_data.get("updated_at"),
+            "jobs": jobs
+        }
+        return {"status": "success", "data": result}
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+class CloudSelectRequest(BaseModel):
+    selected_ids: List[str]
+
+@app.get("/api/v1/cloud/resources")
+def get_cloud_resources(current_user: dict = Depends(get_current_user)):
+    """Mocks fetching available cloud resources from connected AWS/Azure accounts."""
+    try:
+        tenant_email = current_user.get("email")
+        integrations = get_user_integrations(tenant_email)
+        
+        resources = []
+        selected_ids = integrations.get("cloud_selections", [])
+        
+        if integrations.get("aws", {}).get("connected"):
+            resources.extend([
+                {"id": "aws-ec2-i-0abc1234567890def", "name": "production-api-server", "type": "EC2 Instance", "provider": "AWS", "region": "us-east-1", "status": "running"},
+                {"id": "aws-ec2-i-0987654321fedcba0", "name": "worker-node-1", "type": "EC2 Instance", "provider": "AWS", "region": "us-east-1", "status": "running"},
+                {"id": "aws-eks-prod-cluster", "name": "eks-prod-cluster", "type": "EKS Cluster", "provider": "AWS", "region": "us-east-1", "status": "active"},
+                {"id": "aws-s3-prod-assets", "name": "prod-static-assets", "type": "S3 Bucket", "provider": "AWS", "region": "us-east-1", "status": "active"}
+            ])
+            
+        if integrations.get("azure", {}).get("connected"):
+            azure_creds = integrations["azure"].get("credentials", {})
+            client_id = azure_creds.get("client_id")
+            client_secret = azure_creds.get("client_secret")
+            azure_tenant = azure_creds.get("tenant_id")
+            
+            if client_id and client_secret and azure_tenant:
+                try:
+                    from azure.identity import ClientSecretCredential
+                    from azure.mgmt.subscription import SubscriptionClient
+                    from azure.mgmt.resource import ResourceManagementClient
+                    
+                    credential = ClientSecretCredential(
+                        tenant_id=azure_tenant,
+                        client_id=client_id,
+                        client_secret=client_secret
+                    )
+                    
+                    sub_client = SubscriptionClient(credential)
+                    subs = list(sub_client.subscriptions.list())
+                    
+                    for sub in subs:
+                        resource_client = ResourceManagementClient(credential, sub.subscription_id)
+                        # Fetch all standard resources
+                        import re
+                        all_resources = resource_client.resources.list()
+                        for r in all_resources:
+                            rg_match = re.search(r'/resourceGroups/([^/]+)', r.id, re.IGNORECASE)
+                            rg_name = rg_match.group(1) if rg_match else "Unknown"
+                            resources.append({
+                                "id": r.id,
+                                "name": r.name,
+                                "type": r.type.split('/')[-1] if r.type else "Azure Resource",
+                                "provider": "Azure",
+                                "region": r.location,
+                                "status": "active",
+                                "subscription_id": sub.subscription_id,
+                                "resource_group": rg_name
+                            })
+                            
+                        # Also fetch resource groups since they act as containers and might be empty
+                        resource_groups = resource_client.resource_groups.list()
+                        for rg in resource_groups:
+                            resources.append({
+                                "id": rg.id,
+                                "name": rg.name,
+                                "type": "Resource Group",
+                                "provider": "Azure",
+                                "region": rg.location,
+                                "status": "active",
+                                "subscription_id": sub.subscription_id,
+                                "resource_group": rg.name
+                            })
+                except Exception as e:
+                    print(f"Error fetching Azure resources: {e}")
+                    # Fallback or just ignore so it doesn't break AWS or other integrations
+            
+        for r in resources:
+            r["selected"] = r["id"] in selected_ids
+            
+        return resources
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.post("/api/v1/cloud/resources/select")
+def select_cloud_resources(req: CloudSelectRequest, current_user: dict = Depends(get_current_user)):
+    """Saves selected cloud resources to the tenant's integration profile."""
+    try:
+        tenant_email = current_user.get("email")
+        integrations = get_user_integrations(tenant_email)
+        integrations["cloud_selections"] = req.selected_ids
+        update_user_integrations(tenant_email, integrations)
+        return {"status": "success", "message": "Cloud resources selected"}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.get("/api/v1/cloud/logs")
+def get_cloud_logs(current_user: dict = Depends(get_current_user)):
+    """Fetches combined mocked logs for the currently selected cloud resources."""
+    try:
+        tenant_email = current_user.get("email")
+        integrations = get_user_integrations(tenant_email)
+        selected_ids = integrations.get("cloud_selections", [])
+        
+        if not selected_ids:
+            return []
+            
+        # Mock recent logs for the selected resources
+        import random
+        from datetime import datetime, timedelta
+        
+        logs = []
+        now = datetime.utcnow()
+        for idx in range(20):
+            res_id = random.choice(selected_ids)
+            level = random.choices(["INFO", "WARNING", "ERROR"], weights=[80, 15, 5])[0]
+            msg = f"Routine operational trace" if level == "INFO" else f"Memory threshold warning" if level == "WARNING" else f"Connection timed out"
+            logs.append({
+                "resource_id": res_id,
+                "timestamp": (now - timedelta(minutes=random.randint(1, 60))).isoformat() + "Z",
+                "level": level,
+                "message": f"{msg} for {res_id}"
+            })
+            
+        logs.sort(key=lambda x: x["timestamp"], reverse=True)
+        return logs
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+class ArchitectureRequest(BaseModel):
+    provider: str
+
+@app.post("/api/v1/cloud/architecture/generate")
+def generate_architecture_diagram(req: ArchitectureRequest, current_user: dict = Depends(get_current_user)):
+    """Generates an accurate Mermaid architecture diagram from discovered resources."""
+    try:
+        tenant_email = current_user.get("email")
+        integrations = get_user_integrations(tenant_email)
+        selected_ids = integrations.get("cloud_selections", [])
+        
+        # Get all resources for the provider
+        # For simplicity, we fetch all resources and then filter by selected ones
+        # In a real scenario, this would query a cached database table of discovered resources
+        all_resources = get_cloud_resources(current_user=current_user)
+        provider_resources = [r for r in all_resources if r["provider"].lower() == req.provider.lower()]
+        
+        if not provider_resources:
+            return {"mermaid": "graph TD\n    empty[No resources found]"}
+
+        mermaid_lines = ["graph TD", "    classDef default fill:#1e293b,stroke:#475569,stroke-width:2px,color:#f8fafc;"]
+        
+        if req.provider.lower() == "azure":
+            # Group by Subscription -> Resource Group
+            subs = {}
+            for r in provider_resources:
+                sub = r.get("subscription_id", "Unknown Subscription")
+                rg = r.get("resource_group", "Unknown Resource Group")
+                if sub not in subs: subs[sub] = {}
+                if rg not in subs[sub]: subs[sub][rg] = []
+                if r["type"] != "Resource Group":
+                    subs[sub][rg].append(r)
+            
+            sub_idx = 0
+            for sub_name, rgs in subs.items():
+                sub_id = f"sub_{sub_idx}"
+                mermaid_lines.append(f"    subgraph {sub_id}[\"Subscription: {sub_name}\"]")
+                mermaid_lines.append(f"        style {sub_id} fill:#0f172a,stroke:#3b82f6,stroke-dasharray: 5 5")
+                rg_idx = 0
+                for rg_name, res_list in rgs.items():
+                    rg_id = f"{sub_id}_rg_{rg_idx}"
+                    mermaid_lines.append(f"        subgraph {rg_id}[\"Resource Group: {rg_name}\"]")
+                    mermaid_lines.append(f"            style {rg_id} fill:#1e293b,stroke:#0ea5e9,stroke-dasharray: 5 5")
+                    
+                    # Create nodes
+                    for i, r in enumerate(res_list):
+                        node_id = f"{rg_id}_res_{i}"
+                        r['node_id'] = node_id
+                        mermaid_lines.append(f"            {node_id}[\"{r['name']}<br/>({r['type']})\"]")
+                    
+                    # Mock connections (e.g. VM -> VNet)
+                    vms = [r for r in res_list if "virtualMachines" in r['type']]
+                    nets = [r for r in res_list if "virtualNetworks" in r['type']]
+                    dbs = [r for r in res_list if "database" in r['type'].lower() or "sql" in r['type'].lower()]
+                    
+                    for vm in vms:
+                        if nets:
+                            mermaid_lines.append(f"            {vm['node_id']} --> {nets[0]['node_id']}")
+                        if dbs:
+                            mermaid_lines.append(f"            {vm['node_id']} -.-> {dbs[0]['node_id']}")
+                            
+                    mermaid_lines.append("        end")
+                    rg_idx += 1
+                mermaid_lines.append("    end")
+                sub_idx += 1
+                
+        elif req.provider.lower() == "aws":
+            # Mock grouping by Region -> VPC
+            regions = {}
+            for r in provider_resources:
+                reg = r.get("region", "us-east-1")
+                if reg not in regions: regions[reg] = []
+                regions[reg].append(r)
+                
+            reg_idx = 0
+            for reg_name, res_list in regions.items():
+                reg_id = f"reg_{reg_idx}"
+                mermaid_lines.append(f"    subgraph {reg_id}[\"Region: {reg_name}\"]")
+                mermaid_lines.append(f"        style {reg_id} fill:#0f172a,stroke:#f59e0b,stroke-dasharray: 5 5")
+                
+                for i, r in enumerate(res_list):
+                    node_id = f"{reg_id}_res_{i}"
+                    r['node_id'] = node_id
+                    mermaid_lines.append(f"        {node_id}[\"{r['name']}<br/>({r['type']})\"]")
+                    
+                mermaid_lines.append("    end")
+                reg_idx += 1
+
+        return {"mermaid": "\n".join(mermaid_lines)}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+class AnalyzeFailureRequest(BaseModel):
+    log_message: str
+    resource_id: str
+
+@app.get("/api/v1/cloud/azure/resource")
+def get_azure_resource_details(resource_id: str, current_user: dict = Depends(get_current_user)):
+    try:
+        tenant_email = current_user.get("email")
+        from database import get_user_integrations
+        integrations = get_user_integrations(tenant_email)
+        azure_creds = integrations.get("azure", {}).get("credentials", {})
+        client_id = azure_creds.get("client_id")
+        client_secret = azure_creds.get("client_secret")
+        azure_tenant = azure_creds.get("tenant_id")
+        
+        if not (client_id and client_secret and azure_tenant):
+            raise HTTPException(status_code=400, detail="Azure not connected")
+
+        from azure.identity import ClientSecretCredential
+        from azure.mgmt.resource import ResourceManagementClient
+        
+        credential = ClientSecretCredential(
+            tenant_id=azure_tenant,
+            client_id=client_id,
+            client_secret=client_secret
+        )
+        
+        # Extract subscription ID from resource_id (format: /subscriptions/{sub_id}/resourceGroups/...)
+        parts = resource_id.split("/")
+        sub_id = parts[2] if len(parts) > 2 else None
+        if not sub_id:
+            raise HTTPException(status_code=400, detail="Invalid resource ID")
+            
+        resource_client = ResourceManagementClient(credential, sub_id)
+        
+        # Check if it's a resource group or resource
+        is_rg = "/providers/" not in resource_id
+        
+        details = {}
+        children = []
+        
+        if is_rg:
+            rg_name = parts[4]
+            rg = resource_client.resource_groups.get(rg_name)
+            details = {
+                "id": rg.id,
+                "name": rg.name,
+                "type": "Resource Group",
+                "location": rg.location,
+                "tags": rg.tags
+            }
+            # Get children
+            res_list = resource_client.resources.list_by_resource_group(rg_name)
+            for r in res_list:
+                children.append({
+                    "id": r.id,
+                    "name": r.name,
+                    "type": r.type,
+                    "location": r.location
+                })
+        else:
+            # Dynamically determine the correct API version for the resource
+            try:
+                parts_after_providers = resource_id.split('/providers/')[1].split('/')
+                provider_namespace = parts_after_providers[0]
+                resource_type = parts_after_providers[1]
+                
+                provider = resource_client.providers.get(provider_namespace)
+                api_version = "2021-04-01" # Default fallback
+                if provider and provider.resource_types:
+                    for rt in provider.resource_types:
+                        if rt.resource_type.lower() == resource_type.lower() and rt.api_versions:
+                            api_version = rt.api_versions[0]
+                            break
+            except IndexError:
+                api_version = "2021-04-01"
+
+            r = resource_client.resources.get_by_id(resource_id, api_version=api_version)
+            details = {
+                "id": r.id,
+                "name": r.name,
+                "type": r.type,
+                "location": r.location,
+                "tags": r.tags
+            }
+            
+            try:
+                from azure_cost_service import get_estimated_resource_price, get_actual_resource_cost, estimate_aks_cost
+                
+                actual_cost = get_actual_resource_cost(credential, sub_id, resource_id)
+                estimated_cost = None
+                breakdown = []
+                
+                # IMPORTANT NOTE: This complex Azure pricing logic currently resides in api-gateway-service.
+                # Per architecture guidelines, this should eventually be moved to the dedicated cost-insights-service.
+                
+                if "Microsoft.ContainerService/managedClusters" in resource_id and r.properties and "agentPoolProfiles" in r.properties:
+                    node_pools = []
+                    for ap in r.properties["agentPoolProfiles"]:
+                        node_pools.append({
+                            "name": ap.get("name"),
+                            "vmSize": ap.get("vmSize"),
+                            "count": ap.get("count"),
+                            "mode": ap.get("mode")
+                        })
+                    estimated_cost, breakdown = estimate_aks_cost(node_pools, r.location, "INR")
+                else:
+                    sku_name = None
+                    if hasattr(r, 'sku') and r.sku and hasattr(r.sku, 'name'):
+                        sku_name = r.sku.name
+                        
+                    if sku_name:
+                        estimated_cost = get_estimated_resource_price(r.type, sku_name, r.location, "INR")
+                    else:
+                        estimated_cost = {
+                            "status": "unavailable",
+                            "warnings": ["Estimated price unavailable without SKU."]
+                        }
+                        
+                details["cost_intelligence"] = {
+                    "actual_cost": actual_cost,
+                    "estimated_running_price": estimated_cost,
+                    "breakdown": breakdown
+                }
+            except Exception as e:
+                print(f"Cost estimation error: {e}")
+                details["cost_intelligence"] = {
+                    "actual_cost": {"status": "unavailable", "message": "Error calculating cost"},
+                    "estimated_running_price": {"status": "unavailable"},
+                    "breakdown": []
+                }
+            
+            # If it's an AKS cluster, fetch kubernetes internals
+            if "Microsoft.ContainerService/managedClusters" in resource_id:
+                try:
+                    from kubernetes_helper import fetch_aks_kubeconfig, get_kubernetes_workloads, AKSPermissionError
+                    rg_name = parts[4]
+                    cluster_name = parts[8]
+                    kubeconfig_str = fetch_aks_kubeconfig(credential, sub_id, rg_name, cluster_name)
+                    details["kubernetes"] = get_kubernetes_workloads(kubeconfig_str)
+                except Exception as k8s_err:
+                    if type(k8s_err).__name__ == "AKSPermissionError":
+                        err_data = getattr(k8s_err, "error_data", {})
+                        details["kubernetes"] = err_data
+                        details["kubernetes"]["enabled"] = False
+                        details["kubernetes"]["connection_status"] = "failed"
+                        details["kubernetes"]["reason"] = err_data.get("status", "permission_missing")
+                    else:
+                        details["kubernetes"] = {
+                            "enabled": False,
+                            "connection_status": "failed",
+                            "reason": "permission_missing" if "permission" in str(k8s_err).lower() else "unknown",
+                            "message": str(k8s_err),
+                            "recommended_action": "Ensure Service Principal has AKS Cluster User role."
+                        }
+            
+        return {"details": details, "children": children, "tenant_id": azure_tenant, "user_email": tenant_email}
+    except Exception as e:
+        print(f"Error fetching resource details: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.get("/api/v1/cloud/azure/activity")
+def get_azure_resource_activity(resource_id: str, current_user: dict = Depends(get_current_user)):
+    try:
+        tenant_email = current_user.get("email")
+        from database import get_user_integrations
+        integrations = get_user_integrations(tenant_email)
+        azure_creds = integrations.get("azure", {}).get("credentials", {})
+        client_id = azure_creds.get("client_id")
+        client_secret = azure_creds.get("client_secret")
+        azure_tenant = azure_creds.get("tenant_id")
+        
+        if not (client_id and client_secret and azure_tenant):
+            raise HTTPException(status_code=400, detail="Azure not connected")
+
+        from azure.identity import ClientSecretCredential
+        from azure.mgmt.monitor import MonitorManagementClient
+        
+        credential = ClientSecretCredential(
+            tenant_id=azure_tenant,
+            client_id=client_id,
+            client_secret=client_secret
+        )
+        
+        parts = resource_id.split("/")
+        sub_id = parts[2] if len(parts) > 2 else None
+        
+        monitor_client = MonitorManagementClient(credential, sub_id)
+        
+        # Get logs from last 7 days for this resource
+        today = datetime.datetime.utcnow()
+        start = today - datetime.timedelta(days=7)
+        filter_str = f"eventTimestamp ge '{start.isoformat()}Z' and eventTimestamp le '{today.isoformat()}Z' and resourceUri eq '{resource_id}'"
+        
+        logs_iter = monitor_client.activity_logs.list(filter=filter_str)
+        
+        activities = []
+        for log in logs_iter:
+            # We specifically want failures, but we'll return all and let frontend highlight failures
+            status = log.status.localized_value if log.status else "Unknown"
+            activities.append({
+                "id": log.id,
+                "operationName": log.operation_name.localized_value if log.operation_name else "Unknown",
+                "status": status,
+                "eventTimestamp": log.event_timestamp.isoformat() if log.event_timestamp else None,
+                "level": log.level.value if log.level else "Info",
+                "description": log.description if log.description else status
+            })
+            if len(activities) >= 50: # Limit to 50
+                break
+                
+        return activities
+    except Exception as e:
+        print(f"Error fetching activity logs: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.post("/api/v1/ai/analyze-failure")
+def analyze_failure(req: AnalyzeFailureRequest, current_user: dict = Depends(get_current_user)):
+    try:
+        from langchain_aws import ChatBedrock
+        import boto3
+        import os
+        
+        aws_region = os.getenv("AWS_REGION", "us-east-1")
+        bedrock_client = boto3.client("bedrock-runtime", region_name=aws_region)
+        model = ChatBedrock(
+            client=bedrock_client,
+            model_id=os.getenv("BEDROCK_MODEL_ID", "anthropic.claude-3-haiku-20240307-v1:0"),
+            model_kwargs={"temperature": 0.1}
+        )
+        
+        prompt = f"""You are an expert Cloud SRE and AI Copilot. 
+Analyze the following Azure failure log for resource {req.resource_id}.
+Provide a concise 'Root Cause' and a step-by-step 'Solution'. Use markdown formatting.
+
+Log message:
+{req.log_message}
+"""
+        response = model.invoke(prompt)
+        return {"analysis": response.content}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"AI analysis failed: {str(e)}")
+
+@app.get("/api/v1/cloud/azure/cost")
+def get_azure_cost(current_user: dict = Depends(get_current_user)):
+    try:
+        tenant_email = current_user.get("email")
+        from database import get_user_integrations
+        integrations = get_user_integrations(tenant_email)
+        azure_creds = integrations.get("azure", {}).get("credentials", {})
+        client_id = azure_creds.get("client_id")
+        client_secret = azure_creds.get("client_secret")
+        azure_tenant = azure_creds.get("tenant_id")
+        
+        if not (client_id and client_secret and azure_tenant):
+            return {"error": "Azure not connected"}
+
+        from azure.identity import ClientSecretCredential
+        from azure.mgmt.subscription import SubscriptionClient
+        from azure_cost_service import get_subscription_cost, get_resource_group_cost
+        
+        credential = ClientSecretCredential(
+            tenant_id=azure_tenant,
+            client_id=client_id,
+            client_secret=client_secret
+        )
+        
+        sub_client = SubscriptionClient(credential)
+        subs = list(sub_client.subscriptions.list())
+        
+        if not subs:
+            return {"error": "No subscriptions found"}
+            
+        sub_id = subs[0].subscription_id
+        
+        sub_cost = get_subscription_cost(credential, sub_id)
+        rg_costs = get_resource_group_cost(credential, sub_id)
+        
+        return {
+            "subscription_id": sub_id,
+            "subscription_cost": sub_cost,
+            "resource_group_costs": rg_costs
+        }
+    except Exception as e:
+        print(f"Cost Error: {e}")
+        return {"error": str(e)}
+
+@app.post("/api/v1/cloud/azure/cost/refresh")
+def refresh_azure_cost(current_user: dict = Depends(get_current_user)):
+    from azure_cost_service import clear_cost_cache
+    clear_cost_cache()
+    return {"message": "Cost cache cleared"}
+
+# --- AWS Proxy Routes ---
+import os
+import urllib.parse
+from fastapi import Request
+
+AWS_INTELLIGENCE_SERVICE_URL = os.getenv("AWS_INTELLIGENCE_SERVICE_URL", "http://aws-intelligence-service:8000")
+GITHUB_INTELLIGENCE_SERVICE_URL = os.getenv("GITHUB_INTELLIGENCE_SERVICE_URL", "http://github-intelligence-service:8000")
+
+@app.post("/api/v1/aws/connect")
+async def aws_connect(req: Request, current_user: dict = Depends(get_current_user)):
+    try:
+        tenant_email = current_user.get("email")
+        from database import get_user_integrations, update_user_integrations
+        import requests
+        
+        try:
+            req_data = await req.json()
+        except Exception as json_err:
+            return JSONResponse(status_code=400, content={
+                "connected": False,
+                "validated": False,
+                "status": "validation_failed",
+                "message": "Invalid JSON request payload."
+            })
+
+        # Normalize payload for the AWS Intelligence Service
+        normalized_payload = {
+            "connection_name": req_data.get("connection_name", "AWS Connection"),
+            "auth_method": req_data.get("auth_method", "access_keys" if req_data.get("access_key_id") else "environment"),
+            "access_key_id": req_data.get("access_key_id"),
+            "secret_access_key": req_data.get("secret_access_key"),
+            "role_arn": req_data.get("role_arn"),
+            "external_id": req_data.get("external_id"),
+            "region": req_data.get("region", req_data.get("default_region", "us-east-1")),
+            "default_region": req_data.get("default_region", req_data.get("region", "us-east-1"))
+        }
+        print(f"AWS connect requested for user (present={bool(tenant_email)})")
+            
+        try:
+            body = requests.post(f"{AWS_INTELLIGENCE_SERVICE_URL}/api/v1/aws/connect", json=normalized_payload, timeout=10)
+        except requests.exceptions.RequestException as e:
+            return JSONResponse(status_code=500, content={
+                "connected": False,
+                "status": "validation_failed",
+                "message": f"Could not connect to AWS Intelligence service: {str(e)}"
+            })
+            
+        if body.status_code != 200:
+            error_detail = "AWS credentials could not be validated."
+            try:
+                error_detail = body.json().get("detail", error_detail)
+            except Exception:
+                pass
+            return JSONResponse(status_code=body.status_code, content={
+                "connected": False,
+                "validated": False,
+                "status": "validation_failed",
+                "message": error_detail
+            })
+            
+        result = body.json()
+        
+        # Read account_id from root level or from connection_details
+        account_id = result.get("account_id") or result.get("connection_details", {}).get("account_id")
+        region = req_data.get("region", req_data.get("default_region", "us-east-1"))
+        auth_method = normalized_payload["auth_method"]
+        
+        # Save full integration metadata securely to DB
+        integrations = get_user_integrations(tenant_email)
+        integrations["aws"] = {
+            "connected": True,
+            "validated": True,
+            "provider": "aws",
+            "account_id": account_id,
+            "region": region,
+            "auth_method": auth_method,
+            "credentials": req_data,
+            "validated_at": datetime.datetime.utcnow().isoformat() + "Z"
+        }
+        update_user_integrations(tenant_email, integrations)
+        print(f"AWS integration saved: provider=aws, region={region}, account_id={account_id}")
+        
+        return {
+            "connected": True,
+            "saved": True,
+            "validated": True,
+            "status": "connected",
+            "provider": "aws",
+            "account_id": account_id,
+            "region": region,
+            "auth_method": auth_method,
+            "message": "AWS connected successfully."
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.get("/api/v1/integrations/status")
+def integrations_status(current_user: dict = Depends(get_current_user)):
+    try:
+        tenant_email = current_user.get("email")
+        from database import get_user_integrations
+        import requests
+        
+        integrations = get_user_integrations(tenant_email)
+        
+        # 1. AWS Status — use shared resolver
+        aws_response = resolve_aws_status(tenant_email)
+
+        # 2. GitHub Status
+        github_data = integrations.get("github", integrations.get("github_actions", {}))
+        github_creds = github_data.get("credentials", {})
+        github_token = github_creds.get("github_token", os.getenv("GITHUB_PAT"))
+        github_has_token = bool(github_token)
+        github_connected = False
+        github_username = None
+        
+        if github_has_token:
+            headers = {"X-GitHub-Token": github_token}
+            try:
+                res = requests.get(f"{GITHUB_INTELLIGENCE_SERVICE_URL}/api/v1/github/status", headers=headers, timeout=10)
+                if res.status_code == 200:
+                    github_connected = True
+                    github_username = res.json().get("username", "Connected User")
+            except:
+                pass
+
+        # 3. Azure Status
+        azure_data = integrations.get("azure", integrations.get("microsoft_azure", {}))
+        azure_creds = azure_data.get("credentials", {})
+        azure_has_credentials = bool(azure_creds.get("client_id") and azure_creds.get("client_secret"))
+        azure_connected = azure_has_credentials
+            
+        # Prepare GitHub Status
+        github_response = {
+            "saved": github_has_token,
+            "validated": github_connected,
+            "connected": github_connected,
+            "has_token": github_has_token,
+            "status": "connected" if github_connected else ("validation_failed" if github_has_token else "disconnected"),
+            "provider": "github"
+        }
+        if github_connected:
+            github_response["username"] = github_username
+        elif github_has_token:
+            github_response["message"] = "GitHub token is invalid or missing permissions."
+            
+        # Prepare Azure Status
+        azure_response = {
+            "saved": azure_has_credentials,
+            "validated": azure_connected,
+            "connected": azure_connected,
+            "has_credentials": azure_has_credentials,
+            "status": "connected" if azure_connected else "disconnected",
+            "provider": "azure"
+        }
+        if azure_has_credentials:
+            azure_response["subscription_id"] = azure_creds.get("subscription_id")
+            azure_response["tenant_id"] = azure_creds.get("tenant_id")
+
+        return {
+            "aws": aws_response,
+            "github": github_response,
+            "azure": azure_response
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Error validating integrations: {str(e)}")
+
+@app.get("/api/v1/aws/status")
+def aws_status(current_user: dict = Depends(get_current_user)):
+    """Returns AWS connection status using the shared resolver."""
+    try:
+        tenant_email = current_user.get("email")
+        return resolve_aws_status(tenant_email)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.post("/api/v1/aws/resources/sync")
+def aws_resources_sync(req: Request, current_user: dict = Depends(get_current_user)):
+    try:
+        tenant_email = current_user.get("email")
+        from database import get_user_integrations
+        import requests
+        
+        creds = get_aws_credentials_for_tenant(tenant_email)
+        
+        auth_method = "environment"
+        if creds.get("access_key_id") and creds.get("secret_access_key"):
+            auth_method = "access_keys"
+        elif creds.get("role_arn"):
+            auth_method = "assume_role"
+            
+        payload = {
+            "auth_method": auth_method,
+            "access_key_id": creds.get("access_key_id"),
+            "secret_access_key": creds.get("secret_access_key"),
+            "role_arn": creds.get("role_arn"),
+            "external_id": creds.get("external_id"),
+            "regions": [creds.get("region", creds.get("default_region", "us-east-1"))]
+        }
+        
+        res = requests.post(f"{AWS_INTELLIGENCE_SERVICE_URL}/api/v1/aws/resources/sync", json=payload, timeout=60)
+        if res.status_code != 200:
+            raise HTTPException(status_code=res.status_code, detail=res.text)
+            
+        return res.json()
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.get("/api/v1/aws/resources")
+def aws_resources(current_user: dict = Depends(get_current_user)):
+    import requests
+    res = requests.get(f"{AWS_INTELLIGENCE_SERVICE_URL}/api/v1/aws/resources", timeout=10)
+    if res.status_code != 200:
+        raise HTTPException(status_code=res.status_code, detail="Failed to fetch resources")
+    return res.json()
+
+@app.get("/api/v1/aws/resources/{resource_id:path}")
+def aws_resource_details(resource_id: str, current_user: dict = Depends(get_current_user)):
+    import requests
+    # Find resource in the list to return details
+    import urllib.parse
+    safe_id = urllib.parse.quote(urllib.parse.unquote(resource_id), safe="")
+    try:
+        res = requests.get(f"{AWS_INTELLIGENCE_SERVICE_URL}/api/v1/aws/resources/{safe_id}", timeout=10)
+        if res.status_code == 200:
+            return res.json()
+    except Exception:
+        pass
+    raise HTTPException(status_code=404, detail="Resource not found")
+
+@app.get("/api/v1/aws/resources/{resource_id:path}/subresources")
+def aws_resource_subresources(resource_id: str, current_user: dict = Depends(get_current_user)):
+    import requests
+    import urllib.parse
+    safe_id = urllib.parse.quote(urllib.parse.unquote(resource_id), safe="")
+    try:
+        res = requests.get(f"{AWS_INTELLIGENCE_SERVICE_URL}/api/v1/aws/resources/{safe_id}/subresources", timeout=10)
+        if res.status_code == 200:
+            return res.json()
+        elif res.status_code == 400:
+            raise HTTPException(status_code=400, detail=res.json().get("detail", "Bad Request"))
+    except Exception as e:
+        if isinstance(e, HTTPException): raise e
+    return {"status": "error", "warnings": ["Failed to connect to Intelligence Service"], "subresources": {}}
+
+@app.get("/api/v1/aws/resources/{resource_id:path}/runtime")
+def aws_resource_runtime(resource_id: str, current_user: dict = Depends(get_current_user)):
+    import requests
+    import urllib.parse
+    safe_id = urllib.parse.quote(urllib.parse.unquote(resource_id), safe="")
+    try:
+        res = requests.get(f"{AWS_INTELLIGENCE_SERVICE_URL}/api/v1/aws/resources/{safe_id}/runtime", timeout=10)
+        if res.status_code == 200:
+            return res.json()
+        elif res.status_code == 400:
+            raise HTTPException(status_code=400, detail=res.json().get("detail", "Runtime discovery not supported for this resource type"))
+    except Exception as e:
+        if isinstance(e, HTTPException): raise e
+    return {"status": "error", "message": "Failed to connect to Intelligence Service", "runtime": {"containers": [], "processes": []}}
+
+@app.get("/api/v1/aws/resources/{resource_id:path}/cost")
+def aws_resource_cost(resource_id: str, current_user: dict = Depends(get_current_user)):
+    import requests
+    import urllib.parse
+    safe_id = urllib.parse.quote(urllib.parse.unquote(resource_id), safe="")
+    try:
+        res = requests.get(f"{AWS_INTELLIGENCE_SERVICE_URL}/api/v1/aws/resources/{safe_id}/cost", timeout=10)
+        if res.status_code != 200:
+            return {
+                "cost_status": "unavailable",
+                "reason": "Cost Explorer permission missing or resource-level cost tags are not configured."
+            }
+        return res.json()
+    except Exception:
+        return {
+            "cost_status": "unavailable",
+            "reason": "Cost Explorer permission missing or resource-level cost tags are not configured."
+        }
+
+@app.get("/api/v1/aws/resources/{resource_id:path}/risks")
+def aws_resource_risks(resource_id: str, current_user: dict = Depends(get_current_user)):
+    import requests
+    safe_id = urllib.parse.quote(urllib.parse.unquote(resource_id), safe="")
+    res = requests.get(f"{AWS_INTELLIGENCE_SERVICE_URL}/api/v1/aws/resources/{safe_id}/risks", timeout=10)
+    if res.status_code != 200:
+        raise HTTPException(status_code=res.status_code, detail="Failed to fetch risks")
+    return res.json()
+
+@app.get("/api/v1/aws/resources/{resource_id:path}/logs")
+def aws_resource_logs(resource_id: str, current_user: dict = Depends(get_current_user)):
+    import requests
+    safe_id = urllib.parse.quote(urllib.parse.unquote(resource_id), safe="")
+    try:
+        res = requests.get(f"{AWS_INTELLIGENCE_SERVICE_URL}/api/v1/aws/resources/{safe_id}/logs", timeout=10)
+        if res.status_code != 200:
+            return {
+                "status": "partial_success",
+                "logs_available": False,
+                "message": "No CloudWatch log group is linked to this EC2 instance.",
+                "warnings": [
+                    "CloudWatch Agent may not be configured.",
+                    "CloudTrail lookup permission may be missing."
+                ]
+            }
+        return res.json()
+    except Exception:
+        return {
+            "status": "partial_success",
+            "logs_available": False,
+            "message": "No CloudWatch log group is linked to this EC2 instance.",
+            "warnings": [
+                "CloudWatch Agent may not be configured.",
+                "CloudTrail lookup permission may be missing."
+            ]
+        }
+
+@app.get("/api/v1/aws/resources/{resource_id:path}/metrics")
+def aws_resource_metrics(resource_id: str, current_user: dict = Depends(get_current_user)):
+    import requests
+    safe_id = urllib.parse.quote(urllib.parse.unquote(resource_id), safe="")
+    res = requests.get(f"{AWS_INTELLIGENCE_SERVICE_URL}/api/v1/aws/resources/{safe_id}/metrics", timeout=10)
+    if res.status_code != 200:
+        raise HTTPException(status_code=res.status_code, detail="Failed to fetch metrics")
+    return res.json()
+
+@app.post("/api/v1/aws/resources/{resource_id:path}/rca")
+async def aws_resource_rca(resource_id: str, req: Request, current_user: dict = Depends(get_current_user)):
+    import requests
+    safe_id = urllib.parse.quote(urllib.parse.unquote(resource_id), safe="")
+    req_data = await req.json()
+    res = requests.post(f"{AWS_INTELLIGENCE_SERVICE_URL}/api/v1/aws/resources/{safe_id}/rca", json=req_data, timeout=60)
+    if res.status_code != 200:
+        raise HTTPException(status_code=res.status_code, detail="Failed to fetch RCA")
+    return res.json()
+
+@app.get("/api/v1/aws/resources/{resource_id:path}/events")
+def aws_resource_events(resource_id: str, current_user: dict = Depends(get_current_user)):
+    import requests
+    safe_id = urllib.parse.quote(urllib.parse.unquote(resource_id), safe="")
+    try:
+        res = requests.get(f"{AWS_INTELLIGENCE_SERVICE_URL}/api/v1/aws/resources/{safe_id}/events", timeout=10)
+        if res.status_code == 200:
+            return res.json()
+    except Exception:
+        pass
+    return {"events": []}
+
+@app.get("/api/v1/aws/resources/{resource_id:path}/relationships")
+def aws_resource_relationships(resource_id: str, current_user: dict = Depends(get_current_user)):
+    import requests
+    safe_id = urllib.parse.quote(urllib.parse.unquote(resource_id), safe="")
+    try:
+        res = requests.get(f"{AWS_INTELLIGENCE_SERVICE_URL}/api/v1/aws/resources/{safe_id}/relationships", timeout=10)
+        if res.status_code == 200:
+            return res.json()
+    except Exception:
+        pass
+    return {"relationships": []}
+
+# --- GitHub Sync Routes ---
+from fastapi.responses import JSONResponse
+
+def get_github_token_for_tenant(tenant_email: str) -> str:
+    integrations = get_user_integrations(tenant_email)
+    github_aliases = ["github", "github_actions", "github-actions", "github_pat", "version_control", "source_control"]
+    
+    pat = None
+    for alias in github_aliases:
+        data = integrations.get(alias, {})
+        pat = data.get("credentials", {}).get("github_token")
+        if pat:
+            break
+            
+    if not pat:
+        pat = os.getenv("GITHUB_PAT")
+    
+    if not pat:
+        return None
+    return pat
+
+def get_aws_credentials_for_tenant(tenant_email: str) -> dict:
+    integrations = get_user_integrations(tenant_email)
+    aws_aliases = ["aws", "amazon_web_services", "amazon-aws", "aws_cloud", "cloud_aws"]
+    for alias in aws_aliases:
+        if alias in integrations:
+            return integrations[alias].get("credentials", {})
+    return {}
+
+def _get_aws_integration_record(tenant_email: str) -> dict:
+    """Returns the full AWS integration record (not just credentials) checking all provider aliases."""
+    integrations = get_user_integrations(tenant_email)
+    aws_aliases = ["aws", "amazon_web_services", "amazon-aws", "aws_cloud", "cloud_aws"]
+    for alias in aws_aliases:
+        if alias in integrations and integrations[alias]:
+            return integrations[alias]
+    return {}
+
+def resolve_aws_status(tenant_email: str) -> dict:
+    """
+    Shared AWS status resolver used by both /api/v1/aws/status and /api/v1/integrations/status.
+    Reads the saved integration record from DynamoDB. If the record has connected=true and
+    validated=true, returns connected. Otherwise, checks if credentials exist and attempts
+    live validation as a fallback.
+    Never logs or returns secrets.
+    """
+    import requests as _requests
+    
+    aws_record = _get_aws_integration_record(tenant_email)
+    aws_creds = aws_record.get("credentials", {})
+    aws_has_credentials = bool(aws_creds.get("access_key_id") or aws_creds.get("role_arn"))
+    
+    print(f"AWS status requested: user_id present={bool(tenant_email)}, "
+          f"aliases checked=[aws, amazon_web_services, amazon-aws, aws_cloud, cloud_aws], "
+          f"integration_found={bool(aws_record)}, "
+          f"saved_provider={aws_record.get('provider', 'N/A')}, "
+          f"saved_region={aws_record.get('region', 'N/A')}, "
+          f"account_id={aws_record.get('account_id', 'N/A')}")
+    
+    # Fast path: if the record was previously validated and saved, trust it
+    if aws_record.get("connected") and aws_record.get("validated"):
+        return {
+            "connected": True,
+            "saved": True,
+            "validated": True,
+            "has_credentials": aws_has_credentials,
+            "status": "connected",
+            "provider": "aws",
+            "account_id": aws_record.get("account_id"),
+            "region": aws_record.get("region", aws_creds.get("region", "us-east-1")),
+            "auth_method": aws_record.get("auth_method", "access_keys")
+        }
+    
+    # Fallback: if credentials exist but record isn't marked validated, try live validation
+    if aws_has_credentials:
+        try:
+            _aws_svc_url = os.getenv("AWS_INTELLIGENCE_SERVICE_URL", "http://aws-intelligence-service:8000")
+            payload = {
+                "connection_name": "AWS Status Check",
+                "auth_method": "access_keys" if aws_creds.get("access_key_id") and aws_creds.get("secret_access_key") else ("assume_role" if aws_creds.get("role_arn") else "environment"),
+                "access_key_id": aws_creds.get("access_key_id"),
+                "secret_access_key": aws_creds.get("secret_access_key"),
+                "role_arn": aws_creds.get("role_arn"),
+                "external_id": aws_creds.get("external_id"),
+                "region": aws_creds.get("region", aws_creds.get("default_region", "us-east-1"))
+            }
+            res = _requests.post(f"{_aws_svc_url}/api/v1/aws/connect", json=payload, timeout=10)
+            if res.status_code == 200:
+                result = res.json()
+                account_id = result.get("account_id") or result.get("connection_details", {}).get("account_id")
+                region = payload["region"]
+                
+                # Upgrade the saved record so future checks use the fast path
+                integrations = get_user_integrations(tenant_email)
+                if "aws" not in integrations:
+                    integrations["aws"] = {}
+                integrations["aws"]["connected"] = True
+                integrations["aws"]["validated"] = True
+                integrations["aws"]["provider"] = "aws"
+                integrations["aws"]["account_id"] = account_id
+                integrations["aws"]["region"] = region
+                integrations["aws"]["auth_method"] = payload["auth_method"]
+                integrations["aws"]["validated_at"] = datetime.datetime.utcnow().isoformat() + "Z"
+                if not integrations["aws"].get("credentials"):
+                    integrations["aws"]["credentials"] = aws_creds
+                update_user_integrations(tenant_email, integrations)
+                print(f"AWS status: live validation succeeded, record upgraded. account_id={account_id}")
+                
+                return {
+                    "connected": True,
+                    "saved": True,
+                    "validated": True,
+                    "has_credentials": True,
+                    "status": "connected",
+                    "provider": "aws",
+                    "account_id": account_id,
+                    "region": region,
+                    "auth_method": payload["auth_method"]
+                }
+            else:
+                print(f"AWS status: live validation failed with status_code={res.status_code}")
+        except Exception as e:
+            print(f"AWS status: live validation error: {str(e)}")
+        
+        return {
+            "connected": False,
+            "saved": True,
+            "validated": False,
+            "has_credentials": True,
+            "status": "validation_failed",
+            "provider": "aws",
+            "message": "AWS credentials could not be validated."
+        }
+    
+    # No credentials found
+    return {
+        "connected": False,
+        "saved": False,
+        "validated": False,
+        "has_credentials": False,
+        "status": "disconnected",
+        "provider": "aws",
+        "message": "Connect AWS in Integrations."
+    }
+
+@app.get("/api/v1/github/status")
+def github_status_proxy(current_user: dict = Depends(get_current_user)):
+    import requests
+    pat = get_github_token_for_tenant(current_user.get("email"))
+    if not pat:
+        return JSONResponse(status_code=200, content={
+            "connected": False,
+            "validated": False,
+            "status": "github_not_connected",
+            "error_code": "github_pat_missing",
+            "message": "Connect your GitHub PAT in Integrations."
+        })
+    headers = {"X-GitHub-Token": pat}
+    res = requests.get(f"{GITHUB_INTELLIGENCE_SERVICE_URL}/api/v1/github/status", headers=headers, timeout=15)
+    if res.status_code == 401:
+        return JSONResponse(status_code=200, content={
+            "connected": False,
+            "validated": False,
+            "status": "validation_failed",
+            "error_code": "github_pat_invalid",
+            "message": "GitHub token is invalid or expired."
+        })
+    elif res.status_code == 403:
+        return JSONResponse(status_code=200, content={
+            "connected": False,
+            "validated": False,
+            "status": "validation_failed",
+            "error_code": "github_permission_missing",
+            "message": "GitHub token does not have permission to read repositories or Actions workflows."
+        })
+    if res.status_code != 200:
+        return JSONResponse(status_code=res.status_code, content={"message": res.text})
+    
+    # Successful connection
+    data = res.json()
+    return JSONResponse(status_code=200, content={
+        "connected": True,
+        "validated": True,
+        "status": "connected",
+        "username": data.get("username", "Sathvik307393"),
+        "message": "GitHub connected successfully."
+    })
+
+@app.post("/api/v1/github/sync")
+async def github_sync_proxy(req: Request, current_user: dict = Depends(get_current_user)):
+    import requests
+    pat = get_github_token_for_tenant(current_user.get("email"))
+    if not pat:
+        return JSONResponse(status_code=200, content={
+            "connected": False,
+            "status": "github_not_connected",
+            "error_code": "github_pat_missing",
+            "message": "Connect your GitHub PAT in Integrations to sync repositories and workflows."
+        })
+    headers = {"X-GitHub-Token": pat}
+    try:
+        data = await req.json()
+    except Exception:
+        data = {"scope": "owned"}
+    print(f"GitHub sync scope={data.get('scope', 'owned')}")
+    res = requests.post(f"{GITHUB_INTELLIGENCE_SERVICE_URL}/api/v1/github/sync", json=data, headers=headers, timeout=120)
+    if res.status_code == 401:
+        return JSONResponse(status_code=200, content={
+            "connected": False,
+            "status": "permission_required",
+            "error_code": "github_pat_invalid",
+            "message": "GitHub token is invalid or expired."
+        })
+    elif res.status_code == 403:
+        return JSONResponse(status_code=200, content={
+            "connected": False,
+            "status": "permission_required",
+            "error_code": "github_permission_missing",
+            "message": "GitHub token does not have permission to read repositories or Actions workflows."
+        })
+    if res.status_code != 200:
+        return JSONResponse(status_code=res.status_code, content={"message": res.text})
+    return res.json()
+
+@app.get("/api/v1/github/repos")
+def github_repos_proxy(current_user: dict = Depends(get_current_user)):
+    import requests
+    pat = get_github_token_for_tenant(current_user.get("email"))
+    if not pat:
+        return JSONResponse(status_code=400, content={"message": "GitHub PAT is not connected."})
+    headers = {"X-GitHub-Token": pat}
+    res = requests.get(f"{GITHUB_INTELLIGENCE_SERVICE_URL}/api/v1/github/repos", headers=headers, timeout=15)
+    if res.status_code != 200:
+        return JSONResponse(status_code=res.status_code, content={"message": res.text})
+    return res.json()
+
+@app.get("/api/v1/github/workflows")
+def github_workflows_proxy(current_user: dict = Depends(get_current_user)):
+    import requests
+    pat = get_github_token_for_tenant(current_user.get("email"))
+    if not pat:
+        return JSONResponse(status_code=400, content={"message": "GitHub PAT is not connected."})
+    headers = {"X-GitHub-Token": pat}
+    res = requests.get(f"{GITHUB_INTELLIGENCE_SERVICE_URL}/api/v1/github/workflows", headers=headers, timeout=15)
+    if res.status_code != 200:
+        return JSONResponse(status_code=res.status_code, content={"message": res.text})
+    return res.json()
+
+@app.get("/api/v1/github/runs")
+def github_runs_proxy(current_user: dict = Depends(get_current_user)):
+    import requests
+    pat = get_github_token_for_tenant(current_user.get("email"))
+    if not pat:
+        return JSONResponse(status_code=400, content={"message": "GitHub PAT is not connected."})
+    headers = {"X-GitHub-Token": pat}
+    res = requests.get(f"{GITHUB_INTELLIGENCE_SERVICE_URL}/api/v1/github/runs", headers=headers, timeout=15)
+    if res.status_code != 200:
+        return JSONResponse(status_code=res.status_code, content={"message": res.text})
+    return res.json()
+
+@app.get("/api/v1/github/runs/{owner}/{repo}/{run_id}/logs")
+def github_run_logs_proxy(owner: str, repo: str, run_id: str, current_user: dict = Depends(get_current_user)):
+    import requests
+    pat = get_github_token_for_tenant(current_user.get("email"))
+    if not pat:
+        return JSONResponse(status_code=400, content={"message": "GitHub PAT is not connected."})
+    headers = {"X-GitHub-Token": pat}
+    res = requests.get(f"{GITHUB_INTELLIGENCE_SERVICE_URL}/api/v1/github/runs/{owner}/{repo}/{run_id}/logs", headers=headers, timeout=30)
+    if res.status_code in [401, 403]:
+        return JSONResponse(status_code=400, content={"message": "GitHub PAT is invalid or expired."})
+    if res.status_code != 200:
+        return JSONResponse(status_code=400, content={"message": res.text})
+    return res.json()
+
+@app.post("/api/v1/github/runs/{run_id}/rca")
+async def github_run_rca_proxy(run_id: str, req: Request, current_user: dict = Depends(get_current_user)):
+    import requests
+    pat = get_github_token_for_tenant(current_user.get("email"))
+    if not pat:
+        return JSONResponse(status_code=400, content={"message": "GitHub PAT is not connected."})
+    headers = {"X-GitHub-Token": pat}
+    data = await req.json()
+    res = requests.post(f"{GITHUB_INTELLIGENCE_SERVICE_URL}/api/v1/github/runs/{run_id}/rca", json=data, headers=headers, timeout=120)
+    if res.status_code in [401, 403]:
+        return JSONResponse(status_code=400, content={"message": "GitHub PAT is invalid or expired."})
+    if res.status_code != 200:
+        return JSONResponse(status_code=400, content={"message": res.text})
+    return res.json()
+
+@app.post("/api/v1/github/workflows/{owner}/{repo}/{workflow_id}/dispatch")
+async def github_workflow_dispatch_proxy(owner: str, repo: str, workflow_id: str, req: Request, current_user: dict = Depends(get_current_user)):
+    import requests
+    pat = get_github_token_for_tenant(current_user.get("email"))
+    if not pat:
+        return JSONResponse(status_code=400, content={"message": "GitHub PAT is not connected."})
+    headers = {"X-GitHub-Token": pat}
+    try:
+        data = await req.json()
+    except Exception:
+        data = {"ref": "main"}
+    res = requests.post(f"{GITHUB_INTELLIGENCE_SERVICE_URL}/api/v1/github/workflows/{owner}/{repo}/{workflow_id}/dispatch", json=data, headers=headers, timeout=30)
+    if res.status_code in [401, 403]:
+        return JSONResponse(status_code=400, content={"message": "GitHub PAT does not have workflow dispatch permission."})
+    if res.status_code != 200:
+        return JSONResponse(status_code=res.status_code, content={"message": res.text})
+    return res.json()
+
+@app.api_route("/api/v1/aws/{path:path}", methods=["GET", "POST", "PUT", "DELETE", "PATCH"])
+async def proxy_aws_requests(path: str, request: Request, current_user: dict = Depends(get_current_user)):
+    """
+    Proxies all AWS intelligence requests to aws-intelligence-service.
+    Injects AWS credentials from the central integration state as headers.
+    """
+    tenant_email = current_user.get("email")
+    integrations = get_user_integrations(tenant_email)
+    
+    aws_creds = integrations.get("aws", {}).get("credentials", {})
+    aws_region = integrations.get("aws", {}).get("region", "us-east-1")
+    
+    access_key = aws_creds.get("access_key_id", "")
+    secret_key = aws_creds.get("secret_access_key", "")
+    session_token = aws_creds.get("session_token", "")
+    
+    headers = dict(request.headers)
+    headers.pop("host", None)
+    headers.pop("content-length", None) # Let httpx recalculate
+    
+    if access_key: headers["X-AWS-Access-Key-Id"] = access_key
+    if secret_key: headers["X-AWS-Secret-Access-Key"] = secret_key
+    if session_token: headers["X-AWS-Session-Token"] = session_token
+    if aws_region: headers["X-AWS-Region"] = aws_region
+    headers["X-Tenant-Email"] = tenant_email
+    
+    _aws_svc_url = os.getenv("AWS_INTELLIGENCE_SERVICE_URL", "http://aws-intelligence-service:8000")
+    url = f"{_aws_svc_url}/api/v1/aws/{path}"
+    
+    body = await request.body()
+    
+    async with httpx.AsyncClient() as client:
+        try:
+            proxy_req = client.build_request(
+                method=request.method,
+                url=url,
+                headers=headers,
+                content=body,
+                params=request.query_params
+            )
+            proxy_res = await client.send(proxy_req, timeout=120.0)
+            from fastapi.responses import Response
+            return Response(
+                content=proxy_res.content,
+                status_code=proxy_res.status_code,
+                headers=dict(proxy_res.headers)
+            )
+        except httpx.RequestError as e:
+            raise HTTPException(status_code=502, detail=f"Failed to communicate with AWS intelligence service: {str(e)}")
+
+# --- Artifacts Management ---
+
+class ArtifactResponse(BaseModel):
+    id: str
+    tenant_id: str
+    artifact_type: str
+    file_name: str
+    content_type: str
+    created_at: datetime.datetime
+    status: str
+
+    class Config:
+        from_attributes = True
+
+@app.post("/api/v1/artifacts/architecture", response_model=ArtifactResponse)
+def generate_architecture_artifact(current_user: dict = Depends(get_current_user), db = Depends(get_db)):
+    """Generates a sample architecture diagram, uploads to Blob Storage, and saves metadata."""
+    if not db:
+        raise HTTPException(status_code=500, detail="Database connection unavailable")
+    
+    tenant_id = current_user.get("user_id")
+    artifact_id = str(uuid.uuid4())
+    file_name = f"architecture_{artifact_id[:8]}.svg"
+    content_type = "image/svg+xml"
+    
+    # Dummy SVG generation for demonstration
+    svg_content = f'''<svg xmlns="http://www.w3.org/2000/svg" width="200" height="200">
+        <rect width="100%" height="100%" fill="lightblue"/>
+        <text x="50%" y="50%" font-size="20" text-anchor="middle" alignment-baseline="middle">NexusAI Architecture</text>
+    </svg>'''.encode('utf-8')
+    
+    try:
+        blob_path = upload_artifact_blob(
+            tenant_id=tenant_id,
+            artifact_type="architecture",
+            artifact_id=artifact_id,
+            file_name=file_name,
+            content=svg_content,
+            content_type=content_type
+        )
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to upload to Blob Storage: {e}")
+
+    # Save to PostgreSQL
+    new_artifact = Artifact(
+        id=artifact_id,
+        tenant_id=tenant_id,
+        artifact_type="architecture",
+        blob_container=os.getenv("BLOB_CONTAINER_NAME", "artifacts"),
+        blob_path=blob_path,
+        file_name=file_name,
+        content_type=content_type,
+        status="READY"
+    )
+    
+    db.add(new_artifact)
+    db.commit()
+    db.refresh(new_artifact)
+    
+    return new_artifact
+
+@app.get("/api/v1/artifacts", response_model=List[ArtifactResponse])
+def list_artifacts(current_user: dict = Depends(get_current_user), db = Depends(get_db)):
+    """Lists all artifacts for the current tenant."""
+    if not db:
+        raise HTTPException(status_code=500, detail="Database connection unavailable")
+        
+    tenant_id = current_user.get("user_id")
+    artifacts = db.query(Artifact).filter(Artifact.tenant_id == tenant_id).order_by(Artifact.created_at.desc()).all()
+    return artifacts
+
+@app.get("/api/v1/artifacts/{id}", response_model=ArtifactResponse)
+def get_artifact(id: str, current_user: dict = Depends(get_current_user), db = Depends(get_db)):
+    """Retrieves artifact metadata by ID."""
+    if not db:
+        raise HTTPException(status_code=500, detail="Database connection unavailable")
+        
+    tenant_id = current_user.get("user_id")
+    artifact = db.query(Artifact).filter(Artifact.id == id, Artifact.tenant_id == tenant_id).first()
+    
+    if not artifact:
+        raise HTTPException(status_code=404, detail="Artifact not found")
+        
+    return artifact
+
+@app.get("/api/v1/artifacts/{id}/download")
+def download_artifact(id: str, current_user: dict = Depends(get_current_user), db = Depends(get_db)):
+    """Downloads the actual artifact file from Blob Storage."""
+    if not db:
+        raise HTTPException(status_code=500, detail="Database connection unavailable")
+        
+    tenant_id = current_user.get("user_id")
+    artifact = db.query(Artifact).filter(Artifact.id == id, Artifact.tenant_id == tenant_id).first()
+    
+    if not artifact:
+        raise HTTPException(status_code=404, detail="Artifact not found")
+        
+    try:
+        from fastapi.responses import Response
+        content = download_artifact_blob(artifact.blob_path)
+        return Response(content=content, media_type=artifact.content_type, headers={
+            "Content-Disposition": f"attachment; filename={artifact.file_name}"
+        })
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to download artifact: {e}")
+
+if __name__ == "__main__":
+    uvicorn.run("api:app", host="0.0.0.0", port=8000, reload=True)

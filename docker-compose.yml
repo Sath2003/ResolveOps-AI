@@ -1,0 +1,88 @@
+version: '3.8'
+
+services:
+  postgres:
+    image: postgres:15-alpine
+    container_name: resolveops-postgres
+    ports:
+      - "5432:5432"
+    environment:
+      POSTGRES_USER: resolveopsadmin
+      POSTGRES_PASSWORD: local-db-pass
+      POSTGRES_DB: resolveopsdb
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    restart: always
+
+  frontend:
+    build:
+      context: ./frontend
+    ports:
+      - "3000:3000"
+    environment:
+      - NEXT_PUBLIC_API_BASE_URL=/api
+    depends_on:
+      - api-gateway-service
+
+  api-gateway-service:
+    build:
+      context: ./services/api-gateway-service
+    ports:
+      - "8000:8000"
+    env_file:
+      - .env
+    volumes:
+      - ./data:/app/data
+    depends_on:
+      - postgres
+
+  auth-service:
+    build:
+      context: ./services/auth-service
+    ports:
+      - "8001:8000"
+    env_file:
+      - .env
+
+  github-intelligence-service:
+    build:
+      context: ./services/github-intelligence-service
+    ports:
+      - "8002:8000"
+    env_file:
+      - .env
+
+  azure-intelligence-service:
+    build:
+      context: ./services/azure-intelligence-service
+    ports:
+      - "8003:8000"
+    env_file:
+      - .env
+
+  aws-intelligence-service:
+    build:
+      context: ./services/aws-intelligence-service
+    ports:
+      - "8004:8000"
+    env_file:
+      - .env
+
+  ai-rca-service:
+    build:
+      context: ./services/ai-rca-service
+    ports:
+      - "8005:8000"
+    env_file:
+      - .env
+
+  notification-service:
+    build:
+      context: ./services/notification-service
+    ports:
+      - "8006:8000"
+    env_file:
+      - .env
+
+volumes:
+  postgres_data:
