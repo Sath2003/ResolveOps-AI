@@ -100,7 +100,7 @@ function RegisterForm() {
             <Label htmlFor="reg-name">Full Name</Label>
             <Input
               id="reg-name"
-              placeholder="Sathvik Reddy"
+              placeholder="Enter name"
               value={fullName}
               onChange={(e) => setFullName(e.target.value)}
               required
