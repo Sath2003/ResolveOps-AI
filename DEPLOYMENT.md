@@ -1,6 +1,6 @@
 # Deployment Guide: ResolveOps AI on AWS
 
-This guide walks you through manually deploying the ResolveOps AI application on a single AWS EC2 instance and configuring it to be served securely over HTTPS under the domain `resolvesops-ai.sathvikdevops.site` (with `resolveops-ai.sathvikdevops.site` as a secondary domain) using the GoDaddy DNS manager.
+This guide walks you through manually deploying the ResolveOps AI application on a single AWS EC2 instance and configuring it to be served securely over HTTPS under the domain `resolveops-ai.sathvikdevops.site` using the GoDaddy DNS manager.
 
 ---
 
@@ -36,15 +36,10 @@ This guide walks you through manually deploying the ResolveOps AI application on
 3. Under the **DNS** tab, click **DNS Templates** or **Add Record** directly under the DNS Records table.
 4. Add a new **`A` record**:
    * **Type**: `A`
-   * **Name**: `resolvesops-ai` (this creates `resolvesops-ai.sathvikdevops.site`)
+   * **Name**: `resolveops-ai` (this creates `resolveops-ai.sathvikdevops.site`)
    * **Value**: *Your EC2 Elastic IP address* (e.g., `54.210.12.34`)
    * **TTL**: `1 Hour` (or `Custom` -> `600 seconds` for faster propagation)
-5. *(Optional)* Add a secondary **`A` record** if you also want to support the alternative spelling:
-   * **Type**: `A`
-   * **Name**: `resolveops-ai` (this creates `resolveops-ai.sathvikdevops.site`)
-   * **Value**: *Your EC2 Elastic IP address*
-   * **TTL**: `1 Hour`
-6. Save the records and wait a few minutes for the DNS settings to propagate globally.
+5. Save the records and wait a few minutes for the DNS settings to propagate globally.
 
 ---
 
@@ -142,6 +137,6 @@ You should see logs indicating a successful ACME challenge and certificate acqui
 
 ### Access the Application
 Open your web browser and navigate to:
-* **`https://resolvesops-ai.sathvikdevops.site`**
+* **`https://resolveops-ai.sathvikdevops.site`**
 
 You should see the ResolveOps AI frontend loading securely over HTTPS!
