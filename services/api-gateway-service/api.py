@@ -117,8 +117,13 @@ def request_otp(req: OTPRequest):
     sb_queue = os.getenv("SERVICE_BUS_QUEUE_NAME", "notification-requested")
 
     if not sb_fqdn:
-        print("Warning: SERVICE_BUS_FQDN not set, skipping Service Bus publish")
-        return {"message": f"OTP requested for {req.email}. (Service Bus not configured)"}
+        print("Warning: SERVICE_BUS_FQDN not set, falling back to direct SMTP email send")
+        try:
+            notifications.send_otp_email(req.email, req.full_name, otp_code)
+            return {"message": f"OTP requested for {req.email} (sent directly via SMTP)."}
+        except Exception as e:
+            print(f"Failed to send direct SMTP email: {e}")
+            return {"message": f"OTP requested for {req.email}. (Direct SMTP send failed: {e})"}
 
     try:
         from azure.servicebus import ServiceBusClient, ServiceBusMessage
