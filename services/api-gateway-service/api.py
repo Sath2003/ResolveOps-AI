@@ -214,6 +214,7 @@ def register_user(user: UserAuth):
         keys_table.put_item(Item={
             'api_key': default_key,
             'user_id': user_id,
+            'tenant_id': user_id,
             'email': user.email,
             'name': "Default Integration Key",
             'is_active': True,

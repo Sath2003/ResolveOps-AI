@@ -40,6 +40,8 @@ class ApiKey(Base):
     api_key = Column(String(255), primary_key=True)
     user_id = Column(String(255), index=True)
     tenant_id = Column(String(255), index=True)
+    email = Column(String(255), nullable=True)
+    is_active = Column(Boolean, default=True)
     name = Column(String(255))
     created_at = Column(String(100))
     last_used = Column(String(100), nullable=True)
