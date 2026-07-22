@@ -7,6 +7,8 @@ import mermaid from "mermaid";
 
 mermaid.initialize({
   startOnLoad: false,
+  suppressErrorRendering: true,
+  securityLevel: "loose",
   theme: "dark",
   themeVariables: {
     primaryColor: "#4f46e5",
@@ -24,26 +26,39 @@ function MermaidDiagram({ code }) {
   useEffect(() => {
     if (containerRef.current && code) {
       // Auto-sanitize common LLM Mermaid syntax quirks
-      const cleanedCode = code
+      let cleanedCode = code
         .replace(/-->\|([^|]+)\|>/g, "-->|$1|")
         .replace(/->\|([^|]+)\|>/g, "-->|$1|")
-        .replace(/-->\|([^|]+)\| >/g, "-->|$1|");
+        .replace(/-->\|([^|]+)\| >/g, "-->|$1|")
+        .replace(/style\s+\w+\s+fill:[^;\n]+;\s*/gi, "") // Remove bad inline style directives
+        .replace(/style\s+\w+\s+fill:[^;\n]+$/gi, "");
 
       const id = `mermaid-${Math.random().toString(36).substring(2, 9)}`;
+
+      const cleanupGlobalErrorPopup = () => {
+        const errElem = document.getElementById(`d${id}`) || document.getElementById(`d${id}-fb`);
+        if (errElem) errElem.remove();
+        document.querySelectorAll("[id^='dmermaid']").forEach(el => el.remove());
+      };
+
       mermaid.render(id, cleanedCode).then(({ svg }) => {
+        cleanupGlobalErrorPopup();
         if (containerRef.current) {
           containerRef.current.innerHTML = svg;
         }
       }).catch((err) => {
-        // Fallback retry with basic graph layout if render failed
+        cleanupGlobalErrorPopup();
+        // Fallback retry with simplified text labels if initial render fails
         const fallbackCode = cleanedCode.replace(/\|([^|]+)\|/g, '');
         mermaid.render(`${id}-fb`, fallbackCode).then(({ svg }) => {
+          cleanupGlobalErrorPopup();
           if (containerRef.current) {
             containerRef.current.innerHTML = svg;
           }
         }).catch(() => {
+          cleanupGlobalErrorPopup();
           if (containerRef.current) {
-            containerRef.current.innerHTML = `<pre class="text-amber-400/90 text-xs font-mono p-3 bg-black/50 border border-amber-500/20 rounded-xl overflow-x-auto">${cleanedCode}</pre>`;
+            containerRef.current.innerHTML = `<div class="p-3 text-xs font-mono bg-slate-900/90 text-slate-300 rounded-lg border border-slate-700/50 overflow-x-auto"><div class="text-amber-400 font-semibold mb-1">Diagram Code</div>${cleanedCode}</div>`;
           }
         });
       });
