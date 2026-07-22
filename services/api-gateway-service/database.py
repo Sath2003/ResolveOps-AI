@@ -7,6 +7,8 @@ from pg_database import (
 import pg_database
 
 def SessionLocal():
+    if not pg_database.SessionLocal:
+        return None
     return pg_database.SessionLocal()
 
 class MockDynamoTable:
@@ -342,6 +344,7 @@ def get_predictive_risks(tenant_id: str, limit: int = 50) -> list:
 
 def update_user_integrations(email: str, integrations: dict) -> bool:
     db = SessionLocal()
+    if not db: return False
     try:
         instance = db.query(User).filter_by(email=email).first()
         if instance:
@@ -354,6 +357,7 @@ def update_user_integrations(email: str, integrations: dict) -> bool:
 
 def get_user_integrations(email: str) -> dict:
     db = SessionLocal()
+    if not db: return {}
     try:
         instance = db.query(User).filter_by(email=email).first()
         if instance and instance.integrations:
