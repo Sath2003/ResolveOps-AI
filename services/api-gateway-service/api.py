@@ -1,3 +1,4 @@
+import os
 from fastapi import FastAPI, HTTPException, Depends, Security, BackgroundTasks
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from pydantic import BaseModel
