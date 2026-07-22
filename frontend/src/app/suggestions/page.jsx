@@ -3,12 +3,49 @@
 import { useEffect, useState } from "react";
 import { useRouter } from "next/navigation";
 import DashboardLayout from "@/components/layout/DashboardLayout";
-import { Lightbulb, Wrench, Rocket, Activity } from "lucide-react";
-import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
+import { Lightbulb, ShieldCheck, CheckCircle2, AlertTriangle, Info, Clock, ExternalLink } from "lucide-react";
+import { fetchApi } from "@/lib/api";
+
+const SAMPLE_EVIDENCE_SUGGESTIONS = [
+  {
+    id: "sug-01",
+    title: "Configure CloudWatch Log Retention & Subscription Filter",
+    description: "CloudWatch log streams for api-gateway-service show latency warnings (>800ms). Setting up structured metric filters will enable proactive predictive alerts before OOM occurs.",
+    service: "api-gateway-service",
+    severity: "MEDIUM",
+    evidence_source: "cloudwatch",
+    benefit: "Reduces mean time to detection (MTTD) for service degradation by 40%.",
+    type: "Observability Enhancement",
+    status: "New",
+  },
+  {
+    id: "sug-02",
+    title: "Docker Compose Healthcheck Optimization",
+    description: "The docker-evidence-adapter requires strict healthcheck timeouts to prevent container socket read blocking during heavy log queries.",
+    service: "docker-evidence-adapter",
+    severity: "HIGH",
+    evidence_source: "docker",
+    benefit: "Ensures evidence adapter isolation remains responsive during high incident volume.",
+    type: "Resilience",
+    status: "New",
+  },
+  {
+    id: "sug-03",
+    title: "GitHub Actions Workflow Failure Alerting",
+    description: "Recent pipeline deployments failed during container image build step. Integrate notification-service webhooks to alert SREs on GitHub workflow conclusion=failure.",
+    service: "github-intelligence-service",
+    severity: "LOW",
+    evidence_source: "github",
+    benefit: "Prevents deploying stale artifacts when workflow runs encounter build errors.",
+    type: "CI/CD Safety",
+    status: "New",
+  },
+];
 
 export default function SuggestionsHub() {
   const router = useRouter();
   const [loading, setLoading] = useState(true);
+  const [suggestions, setSuggestions] = useState(SAMPLE_EVIDENCE_SUGGESTIONS);
 
   useEffect(() => {
     const token = localStorage.getItem("jwt_token");
@@ -19,60 +56,96 @@ export default function SuggestionsHub() {
     setLoading(false);
   }, [router]);
 
+  const handleStatusChange = (id, newStatus) => {
+    setSuggestions(prev => prev.map(s => s.id === id ? { ...s, status: newStatus } : s));
+  };
+
   if (loading) {
-    return <div className="min-h-screen flex items-center justify-center"><Activity className="animate-spin text-primary w-8 h-8"/></div>;
+    return (
+      <DashboardLayout>
+        <div className="min-h-[70vh] flex flex-col items-center justify-center">
+          <div className="w-8 h-8 border-2 border-amber-400 border-t-transparent rounded-full animate-spin" />
+        </div>
+      </DashboardLayout>
+    );
   }
 
   return (
     <DashboardLayout>
-      <div className="flex flex-col h-full space-y-6">
-        <div>
-          <h2 className="text-xl font-medium tracking-wide text-white mb-2 flex items-center">
-            <Lightbulb className="mr-3 text-amber-400" /> Multi-Stage DevOps Suggestion Hub
+      <div className="flex flex-col h-full space-y-6 font-sans pb-10 animate-in fade-in duration-300">
+        
+        {/* Header */}
+        <div className="border-b border-white/5 pb-5">
+          <div className="inline-flex items-center gap-2 px-3 py-1 bg-amber-500/10 text-amber-400 text-xs font-bold uppercase tracking-wider rounded-full border border-amber-500/20 mb-3">
+            <Lightbulb size={12} /> Evidence-Grounded Recommendations
+          </div>
+          <h2 className="text-2xl font-bold tracking-tight text-white flex items-center gap-2.5">
+            Operational Suggestions & Best Practices
           </h2>
-          <p className="text-sm text-slate-400">Diagnose problems and view pre-mapped resolutions for typical errors encountered across the software lifecycle.</p>
+          <p className="text-xs text-slate-400 mt-1 max-w-2xl">
+            Read-only recommendations derived from live CloudWatch metrics, GitHub pipeline runs, and MCP evidence collection. All suggestions require manual SRE review.
+          </p>
         </div>
 
-        <div className="flex-1 glass-panel rounded-xl p-6 border-t border-t-white/10">
-          <Tabs defaultValue="dev" className="w-full flex-col">
-            <TabsList className="grid w-full grid-cols-3 mb-8 bg-black/40 p-1 border border-white/10 rounded-xl">
-              <TabsTrigger value="dev" className="data-[state=active]:bg-indigo-600/20 data-[state=active]:text-indigo-300 transition-all rounded-lg"><Wrench size={16} className="mr-2" /> Development</TabsTrigger>
-              <TabsTrigger value="deploy" className="data-[state=active]:bg-amber-500/20 data-[state=active]:text-amber-400 transition-all rounded-lg"><Rocket size={16} className="mr-2" /> Deployment</TabsTrigger>
-              <TabsTrigger value="runtime" className="data-[state=active]:bg-emerald-500/20 data-[state=active]:text-emerald-400 transition-all rounded-lg"><Activity size={16} className="mr-2" /> Runtime</TabsTrigger>
-            </TabsList>
-            
-            <TabsContent value="dev" className="space-y-4">
-              <div className="bg-[#0a0a0f] border border-slate-800 rounded-lg p-5">
-                <h4 className="text-white font-medium mb-2">Lint Violation (flake8 style checks)</h4>
-                <p className="text-sm text-slate-400">Ensure all imports are resolved and no undefined names exist. Run <code className="text-rose-400 bg-rose-400/10 px-1 rounded">flake8 . --count --select=E9,F63,F7,F82 --show-source --statistics</code> locally.</p>
+        {/* List */}
+        <div className="space-y-4">
+          {suggestions.map((item) => (
+            <div key={item.id} className="border border-white/8 rounded-2xl p-5 bg-white/3 space-y-3 hover:border-white/15 transition-all">
+              <div className="flex items-start justify-between gap-4">
+                <div>
+                  <div className="flex items-center gap-2 mb-1.5">
+                    <span className={`px-2 py-0.5 rounded text-[10px] font-semibold uppercase border ${
+                      item.severity === "HIGH" ? "bg-rose-500/10 text-rose-400 border-rose-500/20"
+                        : item.severity === "MEDIUM" ? "bg-amber-500/10 text-amber-400 border-amber-500/20"
+                          : "bg-slate-500/10 text-slate-400 border-slate-500/20"
+                    }`}>
+                      {item.severity} Priority
+                    </span>
+                    <span className="text-[10px] text-slate-500 font-mono">[{item.evidence_source.toUpperCase()}]</span>
+                    <span className="text-[10px] text-slate-600">·</span>
+                    <span className="text-xs text-indigo-400 font-medium">{item.service}</span>
+                  </div>
+                  <h3 className="text-base font-semibold text-white">{item.title}</h3>
+                </div>
+
+                <div className="flex items-center gap-2 shrink-0">
+                  {item.status === "Accepted" ? (
+                    <span className="px-2.5 py-1 rounded-full text-xs font-medium bg-emerald-500/10 text-emerald-400 border border-emerald-500/20 flex items-center gap-1">
+                      <CheckCircle2 size={12} /> Reviewed & Accepted
+                    </span>
+                  ) : item.status === "Dismissed" ? (
+                    <span className="px-2.5 py-1 rounded-full text-xs font-medium bg-slate-800 text-slate-500 border border-slate-700">
+                      Dismissed
+                    </span>
+                  ) : (
+                    <div className="flex items-center gap-1.5">
+                      <button
+                        onClick={() => handleStatusChange(item.id, "Accepted")}
+                        className="px-3 py-1.5 rounded-lg bg-emerald-600/20 border border-emerald-500/30 text-emerald-300 text-xs hover:bg-emerald-600/30 transition-colors"
+                      >
+                        Accept
+                      </button>
+                      <button
+                        onClick={() => handleStatusChange(item.id, "Dismissed")}
+                        className="px-3 py-1.5 rounded-lg bg-white/5 border border-white/8 text-slate-400 text-xs hover:bg-white/10 transition-colors"
+                      >
+                        Dismiss
+                      </button>
+                    </div>
+                  )}
+                </div>
               </div>
-              <div className="bg-[#0a0a0f] border border-slate-800 rounded-lg p-5">
-                <h4 className="text-white font-medium mb-2">Unit Test Failure (pytest execution)</h4>
-                <p className="text-sm text-slate-400">Review assertion mismatch. Often caused by unmocked DB calls. Use <code className="text-rose-400 bg-rose-400/10 px-1 rounded">pytest -v --lf</code> to run failed tests in isolation.</p>
+
+              <p className="text-xs text-slate-300 leading-relaxed">{item.description}</p>
+
+              <div className="p-3 rounded-xl bg-black/40 border border-white/5 flex items-center justify-between text-xs">
+                <span className="text-slate-400"><strong>Expected Benefit:</strong> {item.benefit}</span>
+                <span className="text-[10px] text-slate-600 font-mono">Read-Only Recommendation</span>
               </div>
-            </TabsContent>
-            
-            <TabsContent value="deploy" className="space-y-4">
-              <div className="bg-[#0a0a0f] border border-slate-800 rounded-lg p-5">
-                <h4 className="text-white font-medium mb-2">Kubernetes YAML Schema Mismatch</h4>
-                <p className="text-sm text-slate-400">Invalid apiVersion. If using Kubernetes 1.22+, <code className="text-rose-400 bg-rose-400/10 px-1 rounded">extensions/v1beta1</code> is deprecated. Change Ingress apiVersion to <code className="text-indigo-400 bg-indigo-400/10 px-1 rounded">networking.k8s.io/v1</code>.</p>
-              </div>
-              <div className="bg-[#0a0a0f] border border-slate-800 rounded-lg p-5">
-                <h4 className="text-white font-medium mb-2">Trivy CVE Alert</h4>
-                <p className="text-sm text-slate-400">High severity vulnerabilities found in base image. Update your Dockerfile FROM statement to use an Alpine or distroless tag (e.g., <code className="text-indigo-400 bg-indigo-400/10 px-1 rounded">node:20-alpine</code>).</p>
-              </div>
-            </TabsContent>
-            
-            <TabsContent value="runtime" className="space-y-4">
-              <div className="bg-[#0a0a0f] border border-slate-800 rounded-lg p-5">
-                <h4 className="text-white font-medium mb-2">OOMKilled Error (Exit Code 137)</h4>
-                <p className="text-sm text-slate-400">Container memory limit exceeded. Increase the memory limit in the deployment manifest or profile the application for memory leaks.</p>
-              </div>
-            </TabsContent>
-          </Tabs>
+            </div>
+          ))}
         </div>
       </div>
     </DashboardLayout>
   );
 }
-

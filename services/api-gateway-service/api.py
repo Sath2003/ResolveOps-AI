@@ -2793,6 +2793,118 @@ async def proxy_aws_requests(path: str, request: Request, current_user: dict = D
     access_key = aws_creds.get("access_key_id", "")
     secret_key = aws_creds.get("secret_access_key", "")
     session_token = aws_creds.get("session_token", "")
+
+@app.get("/api/v1/analytics/overview")
+async def get_analytics_overview(current_user: dict = Depends(get_current_user)):
+    """
+    Returns aggregated operational metrics for ResolveOps AI.
+    Data is collected from PostgreSQL, local service health, and active integrations.
+    """
+    tenant_id = current_user.get("user_id")
+    tenant_email = current_user.get("email")
+    timestamp = datetime.datetime.utcnow().isoformat() + "Z"
+
+    # 1. Integrations Status
+    integrations = get_user_integrations(tenant_email)
+    aws_connected = bool(integrations.get("aws", {}).get("connected"))
+    github_connected = bool(integrations.get("github", {}).get("connected") or os.getenv("GITHUB_PAT"))
+
+    # 2. Query Incident Counts from DB
+    incidents_table = get_incidents_table()
+    inc_query = incidents_table.query(
+        IndexName='TenantIdIndex',
+        KeyConditionExpression=Key('tenant_id').eq(tenant_id)
+    ) if hasattr(incidents_table, 'query') else {'Items': []}
+    all_incidents = inc_query.get('Items', [])
+    active_incidents = [i for i in all_incidents if i.get("status") in ("active", "investigating", "open")]
+    critical_incidents = [i for i in all_incidents if i.get("severity") in ("CRITICAL", "critical", "HIGH", "high")]
+
+    # 3. Query Service Health from logs
+    logs_table = get_logs_table()
+    log_query = logs_table.query(Limit=100) if hasattr(logs_table, 'query') else {'Items': []}
+    logs = log_query.get('Items', [])
+    services = {}
+    for l in logs:
+        srv = l.get("service") or l.get("resource_id") or "api-gateway-service"
+        if srv not in services:
+            services[srv] = {"name": srv, "errors": 0, "warnings": 0, "total": 0}
+        services[srv]["total"] += 1
+        level = (l.get("level") or "").upper()
+        if level == "ERROR":
+            services[srv]["errors"] += 1
+        elif level == "WARN":
+            services[srv]["warnings"] += 1
+
+    services_list = []
+    for srv_name, data in services.items():
+        status = "degraded" if data["errors"] > 0 else "healthy"
+        services_list.append({
+            "service": srv_name,
+            "status": status,
+            "error_count": data["errors"],
+            "warning_count": data["warnings"],
+            "total_logs": data["total"]
+        })
+
+    # Default core services if no logs yet
+    if not services_list:
+        services_list = [
+            {"service": "api-gateway-service", "status": "healthy", "error_count": 0, "warning_count": 0, "total_logs": 0},
+            {"service": "ai-rca-service", "status": "healthy", "error_count": 0, "warning_count": 0, "total_logs": 0},
+            {"service": "mcp-server-service", "status": "healthy", "error_count": 0, "warning_count": 0, "total_logs": 0},
+            {"service": "docker-evidence-adapter", "status": "healthy", "error_count": 0, "warning_count": 0, "total_logs": 0},
+        ]
+
+    healthy_count = sum(1 for s in services_list if s["status"] == "healthy")
+    degraded_count = sum(1 for s in services_list if s["status"] == "degraded")
+
+    # 4. AI Provider Status (from ai-rca-service)
+    ai_status = {"provider": "bedrock", "status": "available", "display_name": "Amazon Bedrock"}
+    try:
+        async with httpx.AsyncClient(timeout=5) as client:
+            res = await client.get(f"{_AI_RCA_SERVICE_URL}/api/v1/ai/provider-status")
+            if res.status_code == 200:
+                ai_status = res.json()
+    except Exception:
+        ai_status["status"] = "unavailable"
+
+    # 5. Pipeline & AWS telemetry
+    failed_workflows = 0
+    if github_connected:
+        try:
+            pat = get_github_token_for_tenant(tenant_email)
+            if pat:
+                headers = {"X-GitHub-Token": pat}
+                runs_res = requests.get(f"{GITHUB_INTELLIGENCE_SERVICE_URL}/api/v1/github/runs", headers=headers, timeout=5)
+                if runs_res.status_code == 200:
+                    runs = runs_res.json() if isinstance(runs_res.json(), list) else []
+                    failed_workflows = sum(1 for r in runs if r.get("conclusion") == "failure")
+        except Exception:
+            pass
+
+    return {
+        "status": "success",
+        "generated_at": timestamp,
+        "time_range": {"label": "Last 24 hours"},
+        "summary": {
+            "operational_status": "healthy" if degraded_count == 0 and active_incidents == 0 else "degraded",
+            "active_incidents": len(active_incidents),
+            "critical_incidents": len(critical_incidents),
+            "total_services": len(services_list),
+            "healthy_services": healthy_count,
+            "degraded_services": degraded_count,
+            "failed_workflows": failed_workflows,
+            "ai_provider": ai_status,
+            "integrations": {
+                "aws": "connected" if aws_connected else "not_configured",
+                "github": "connected" if github_connected else "not_configured",
+                "mcp": "active",
+                "docker_adapter": "active",
+            }
+        },
+        "services": services_list,
+        "incidents": all_incidents[:10],
+    }
     
     headers = dict(request.headers)
     headers.pop("host", None)

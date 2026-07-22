@@ -22,3 +22,5 @@ Welcome to the ResolveOps AI architecture and operational documentation reposito
 16. [UI & Chat Behavior Specifications](16-ui-and-chat-behaviour.md)
 17. [Operations Runbook](17-operations-runbook.md)
 18. [Troubleshooting Guide](18-troubleshooting.md)
+19. [Operational Analytics & Telemetry](19-analytics-page.md)
+20. [UI Design System & Component Guidelines](20-ui-design-system.md)
