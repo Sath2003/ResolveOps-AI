@@ -151,15 +151,24 @@ class BedrockClient:
         client = self._get_bedrock_client()
         model_id = settings.BEDROCK_MODEL_ID
 
-        messages = [{"role": "user", "content": prompt}]
-        body: dict = {
-            "anthropic_version": "bedrock-2023-05-31",
-            "max_tokens": max_tokens,
-            "temperature": temperature,
-            "messages": messages,
-        }
-        if system_prompt:
-            body["system"] = system_prompt
+        if "llama" in model_id.lower() or "meta" in model_id.lower():
+            sys_part = f"<|begin_of_text|><|start_header_id|>system<|end_header_id|>\n\n{system_prompt}<|eot_id|>" if system_prompt else "<|begin_of_text|>"
+            prompt_str = f"{sys_part}<|start_header_id|>user<|end_header_id|>\n\n{prompt}<|eot_id|><|start_header_id|>assistant<|end_header_id|>\n\n"
+            body = {
+                "prompt": prompt_str,
+                "max_gen_len": max_tokens,
+                "temperature": temperature,
+            }
+        else:
+            messages = [{"role": "user", "content": prompt}]
+            body = {
+                "anthropic_version": "bedrock-2023-05-31",
+                "max_tokens": max_tokens,
+                "temperature": temperature,
+                "messages": messages,
+            }
+            if system_prompt:
+                body["system"] = system_prompt
 
         try:
             response = client.invoke_model(
@@ -169,13 +178,16 @@ class BedrockClient:
                 accept="application/json",
             )
             result = json.loads(response["body"].read())
-            text = result["content"][0]["text"]
+            if "llama" in model_id.lower() or "meta" in model_id.lower():
+                text = result.get("generation", "")
+            else:
+                text = result["content"][0]["text"]
             logger.info(
                 "Bedrock invocation succeeded",
                 extra={
                     "request_id": request_id,
                     "model": model_id,
-                    "output_tokens": result.get("usage", {}).get("output_tokens", 0),
+                    "output_tokens": result.get("usage", {}).get("output_tokens", result.get("prompt_token_count", 0)),
                 },
             )
             return text
