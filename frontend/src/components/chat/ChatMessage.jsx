@@ -25,13 +25,24 @@ function MermaidDiagram({ code }) {
 
   useEffect(() => {
     if (containerRef.current && code) {
-      // Auto-sanitize common LLM Mermaid syntax quirks
+      let nodeIdx = 0;
+      const labelToId = new Map();
       let cleanedCode = code
         .replace(/-->\|([^|]+)\|>/g, "-->|$1|")
         .replace(/->\|([^|]+)\|>/g, "-->|$1|")
         .replace(/-->\|([^|]+)\| >/g, "-->|$1|")
-        .replace(/style\s+\w+\s+fill:[^;\n]+;\s*/gi, "") // Remove bad inline style directives
+        .replace(/style\s+\w+\s+fill:[^;\n]+;\s*/gi, "")
         .replace(/style\s+\w+\s+fill:[^;\n]+$/gi, "");
+
+      // Auto-assign IDs for standalone quoted nodes: "Label" --> ... => N1["Label"] --> ...
+      cleanedCode = cleanedCode.replace(/(?<=^|\s|-->|->)("[^"\n]+")(?=\s|-->|->|$)/gm, (match) => {
+        const text = match.trim();
+        if (!labelToId.has(text)) {
+          nodeIdx++;
+          labelToId.set(text, `N${nodeIdx}[${text}]`);
+        }
+        return labelToId.get(text);
+      });
 
       const id = `mermaid-${Math.random().toString(36).substring(2, 9)}`;
 

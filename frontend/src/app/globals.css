@@ -106,3 +106,14 @@
     border: 1px solid rgba(6, 182, 212, 0.6);
   }
 }
+
+/* Hide Mermaid error popups/overlays */
+[id^="dmermaid"], [id^="mermaid-error"], svg[id^="dmermaid"] {
+  display: none !important;
+  visibility: hidden !important;
+  opacity: 0 !important;
+  height: 0 !important;
+  width: 0 !important;
+  position: absolute !important;
+  pointer-events: none !important;
+}
