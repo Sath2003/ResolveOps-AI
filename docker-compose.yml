@@ -7,12 +7,17 @@ services:
     ports:
       - "5432:5432"
     environment:
-      POSTGRES_USER: resolveopsadmin
-      POSTGRES_PASSWORD: local-db-pass
-      POSTGRES_DB: resolveopsdb
+      POSTGRES_USER: ${POSTGRES_USER:-resolveopsadmin}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-local-db-pass}
+      POSTGRES_DB: ${POSTGRES_DB:-resolveopsdb}
     volumes:
       - postgres_data:/var/lib/postgresql/data
-    restart: always
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-resolveopsadmin}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    restart: unless-stopped
 
   frontend:
     build:
@@ -23,6 +28,7 @@ services:
       - NEXT_PUBLIC_API_BASE_URL=/api
     depends_on:
       - api-gateway-service
+    restart: unless-stopped
 
   api-gateway-service:
     build:
@@ -34,7 +40,16 @@ services:
     volumes:
       - ./data:/app/data
     depends_on:
-      - postgres
+      postgres:
+        condition: service_healthy
+      ai-rca-service:
+        condition: service_started
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 15s
+      timeout: 5s
+      retries: 3
+    restart: unless-stopped
 
   auth-service:
     build:
@@ -43,6 +58,7 @@ services:
       - "8001:8000"
     env_file:
       - .env
+    restart: unless-stopped
 
   github-intelligence-service:
     build:
@@ -51,14 +67,7 @@ services:
       - "8002:8000"
     env_file:
       - .env
-
-  azure-intelligence-service:
-    build:
-      context: ./services/azure-intelligence-service
-    ports:
-      - "8003:8000"
-    env_file:
-      - .env
+    restart: unless-stopped
 
   aws-intelligence-service:
     build:
@@ -67,6 +76,41 @@ services:
       - "8004:8000"
     env_file:
       - .env
+    restart: unless-stopped
+
+  mcp-server-service:
+    build:
+      context: ./services/mcp-server-service
+    ports:
+      - "8007:8000"
+    env_file:
+      - .env
+    depends_on:
+      - aws-intelligence-service
+      - github-intelligence-service
+      - docker-evidence-adapter
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 15s
+      timeout: 5s
+      retries: 3
+    restart: unless-stopped
+
+  docker-evidence-adapter:
+    build:
+      context: ./services/docker-evidence-adapter
+    ports:
+      - "8008:8000"
+    env_file:
+      - .env
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 15s
+      timeout: 5s
+      retries: 3
+    restart: unless-stopped
 
   ai-rca-service:
     build:
@@ -75,6 +119,14 @@ services:
       - "8005:8000"
     env_file:
       - .env
+    depends_on:
+      - mcp-server-service
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 15s
+      timeout: 5s
+      retries: 3
+    restart: unless-stopped
 
   notification-service:
     build:
@@ -83,6 +135,7 @@ services:
       - "8006:8000"
     env_file:
       - .env
+    restart: unless-stopped
 
 volumes:
   postgres_data:

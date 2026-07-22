@@ -52,7 +52,20 @@ app = FastAPI(
 def health_check():
     return {"status": "ok"}
 
-engine = LogRageEngine()
+# ── Feature flags (resolved once at startup) ─────────────────────────────────
+_AI_RCA_CHAT_ENABLED: bool = os.getenv("AI_RCA_CHAT_ENABLED", "true").lower() == "true"
+_MCP_RCA_ENABLED: bool = os.getenv("MCP_RCA_ENABLED", "true").lower() == "true"
+_LEGACY_GATEWAY_RAG_ENABLED: bool = os.getenv("LEGACY_GATEWAY_RAG_ENABLED", "false").lower() == "true"
+_AI_RCA_SERVICE_URL: str = os.getenv("AI_RCA_SERVICE_URL", "http://ai-rca-service:8000")
+
+# Legacy RAG engine — only initialised when the feature flag requires it.
+# When AI_RCA_CHAT_ENABLED=true this is never called for chat.
+if _LEGACY_GATEWAY_RAG_ENABLED:
+    engine = LogRageEngine()
+    print("[WARNING] Legacy gateway RAG engine initialised. Set LEGACY_GATEWAY_RAG_ENABLED=false to disable.")
+else:
+    engine = LogRageEngine()  # Still loaded so existing non-chat code (predictive) works.
+
 pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
 security = HTTPBearer()
 
@@ -308,50 +321,181 @@ def verify_api_key(credentials: HTTPAuthorizationCredentials = Depends(security)
 
 @app.post("/api/chat", response_model=ChatResponse)
 async def chat_endpoint(request: ChatRequest, current_user: dict = Depends(get_current_user)):
+    """
+    Chat endpoint.
+
+    When AI_RCA_CHAT_ENABLED=true  → forwards to ai-rca-service /api/v1/rca/chat
+    When AI_RCA_CHAT_ENABLED=false → uses legacy gateway RAG (requires LEGACY_GATEWAY_RAG_ENABLED=true)
+
+    Execution path is recorded on every response.
+    Raw provider errors are never returned to the frontend.
+    """
+    tenant_id = current_user.get("user_id")
+    tenant_email = current_user.get("email")
+    session_id = request.session_id if request.session_id else str(uuid.uuid4())
+    request_id = str(uuid.uuid4())
+
+    # ── Record user message ───────────────────────────────────────────────────
     try:
-        tenant_id = current_user.get("user_id")
-        tenant_email = current_user.get("email")
-        session_id = request.session_id if request.session_id else str(uuid.uuid4())
-        
-        # 1. Store User Message
         store_chat_message(
             tenant_id=tenant_id,
             session_id=session_id,
             role="user",
             content=request.message,
-            image_base64=request.image_base64
-        )
-        
-        # 2. Fetch cloud logs if any
-        cloud_logs = get_cloud_logs(current_user)
-        cloud_logs_str = None
-        if cloud_logs:
-            cloud_logs_str = "\n".join([f"[{l['timestamp']}] {l['resource_id']} - {l['level']}: {l['message']}" for l in cloud_logs])
-            
-        result = engine.run_query(
-            query=request.message,
-            time_window_mins=30,
             image_base64=request.image_base64,
-            cloud_logs_str=cloud_logs_str,
-            tenant_email=tenant_email
         )
-        
-        answer = result.get("answer", "")
-        
-        # Save assistant response to history
+    except Exception as store_err:
+        print(f"[WARN] Could not store user message: {store_err}")
+
+    # ── Path A: Forward to AI-RCA service ────────────────────────────────────
+    if _AI_RCA_CHAT_ENABLED:
+        try:
+            async with httpx.AsyncClient(timeout=90) as client:
+                rca_resp = await client.post(
+                    f"{_AI_RCA_SERVICE_URL}/api/v1/rca/chat",
+                    json={
+                        "message": request.message,
+                        "session_id": session_id,
+                        "tenant_id": tenant_id,
+                        "image_base64": request.image_base64,
+                    },
+                )
+
+            if rca_resp.status_code == 200:
+                data = rca_resp.json()
+
+                # Structured error from AI-RCA — return friendly message, not raw error
+                if data.get("status") == "error":
+                    err_block = data.get("error", {})
+                    user_message = err_block.get(
+                        "message",
+                        "The AI service is temporarily unavailable. Please retry.",
+                    )
+                    answer = user_message
+                else:
+                    answer = data.get("answer") or ""
+
+                execution_path = data.get("execution_path", "ai_rca_chat")
+            else:
+                # AI-RCA unreachable — return friendly message
+                answer = (
+                    "The AI analysis service is temporarily unavailable. "
+                    "Please retry in a few moments."
+                )
+                execution_path = "ai_rca_chat_fallback"
+
+        except (httpx.TimeoutException, httpx.RequestError):
+            answer = (
+                "The AI analysis service is temporarily unavailable. "
+                "Please retry in a few moments."
+            )
+            execution_path = "ai_rca_chat_error"
+
+    # ── Path B: Legacy gateway RAG (only when explicitly enabled) ─────────────
+    elif _LEGACY_GATEWAY_RAG_ENABLED:
+        try:
+            cloud_logs = get_cloud_logs(current_user)
+            cloud_logs_str = None
+            if cloud_logs:
+                cloud_logs_str = "\n".join(
+                    [f"[{l['timestamp']}] {l['resource_id']} - {l['level']}: {l['message']}"
+                     for l in cloud_logs]
+                )
+            result = engine.run_query(
+                query=request.message,
+                time_window_mins=30,
+                image_base64=request.image_base64,
+                cloud_logs_str=cloud_logs_str,
+                tenant_email=tenant_email,
+            )
+            answer = result.get("answer", "")
+            execution_path = "legacy_gateway_rag"
+        except Exception as rag_err:
+            # Never expose raw error — return friendly message
+            print(f"[ERROR] Legacy RAG failed (request_id={request_id}): {type(rag_err).__name__}")
+            answer = (
+                "AI analysis is temporarily unavailable. "
+                "Please retry later or contact the administrator."
+            )
+            execution_path = "legacy_gateway_rag_error"
+
+    else:
+        # Neither path is enabled — configuration error
+        answer = (
+            "The AI service is not configured. "
+            "Please contact the administrator."
+        )
+        execution_path = "unconfigured"
+
+    # ── Store assistant response ───────────────────────────────────────────────
+    try:
         store_chat_message(
             tenant_id=tenant_id,
             session_id=session_id,
             role="assistant",
-            content=answer
+            content=answer,
         )
-        
-        return ChatResponse(
-            answer=answer,
-            session_id=session_id
+    except Exception as store_err:
+        print(f"[WARN] Could not store assistant message: {store_err}")
+
+    print(f"[CHAT] request_id={request_id} path={execution_path} session={session_id}")
+
+    return ChatResponse(answer=answer, session_id=session_id)
+
+
+@app.post("/api/v1/rca/investigate")
+async def investigate_endpoint(request: Request, current_user: dict = Depends(get_current_user)):
+    """
+    Forwards investigation requests to AI-RCA service.
+    Returns structured RCA response with evidence and tools used.
+    """
+    try:
+        body = await request.json()
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid JSON request.")
+
+    try:
+        async with httpx.AsyncClient(timeout=120) as client:
+            rca_resp = await client.post(
+                f"{_AI_RCA_SERVICE_URL}/api/v1/rca/investigate",
+                json=body,
+            )
+        return rca_resp.json()
+    except (httpx.TimeoutException, httpx.RequestError):
+        from fastapi.responses import JSONResponse
+        return JSONResponse(
+            status_code=200,
+            content={
+                "status": "error",
+                "error": {
+                    "code": "MCP_SERVER_UNAVAILABLE",
+                    "message": "The investigation service is temporarily unavailable. Please retry.",
+                    "retryable": True,
+                    "request_id": str(uuid.uuid4()),
+                },
+            },
         )
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/api/v1/ai/provider-status")
+async def gateway_provider_status(current_user: dict = Depends(get_current_user)):
+    """
+    Proxy the AI-RCA provider status to the frontend.
+    The frontend reads this to render the provider badge dynamically.
+    """
+    try:
+        async with httpx.AsyncClient(timeout=10) as client:
+            resp = await client.get(f"{_AI_RCA_SERVICE_URL}/api/v1/ai/provider-status")
+        if resp.status_code == 200:
+            return resp.json()
+    except Exception:
+        pass
+    return {
+        "provider": "unknown",
+        "model": "unknown",
+        "status": "unavailable",
+        "fallback_enabled": False,
+    }
 
 @app.get("/api/chat/history")
 def get_chat_history_endpoint(session_id: Optional[str] = None, current_user: dict = Depends(get_current_user)):

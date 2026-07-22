@@ -1,0 +1,278 @@
+"""
+AI-RCA Service — Amazon Bedrock client.
+
+Provides a controlled interface for Bedrock invocations:
+  - Uses the AWS SDK default credential chain (EC2 instance role preferred)
+  - Enforces timeouts
+  - Translates ALL exceptions into internal error codes
+  - Never logs credentials or raw exception bodies at INFO/DEBUG
+  - Optionally falls back to OpenAI only when OPENAI_FALLBACK_ENABLED=true
+"""
+import json
+import logging
+import uuid
+from typing import Optional
+
+import boto3
+from botocore.config import Config
+from botocore.exceptions import (
+    ClientError,
+    EndpointConnectionError,
+    NoCredentialsError,
+    NoRegionError,
+    ReadTimeoutError,
+)
+
+from app.settings import settings
+from app.errors import ErrorCode, classify_provider_exception, build_error_response
+
+logger = logging.getLogger(__name__)
+
+
+class BedrockClient:
+    """Thin wrapper around bedrock-runtime that enforces project-level policies."""
+
+    def __init__(self) -> None:
+        self._client = None
+        self._openai_client = None
+        self._provider = settings.AI_PROVIDER
+
+    def _get_bedrock_client(self):
+        if self._client is None:
+            boto_config = Config(
+                region_name=settings.AWS_REGION,
+                connect_timeout=10,
+                read_timeout=settings.BEDROCK_REQUEST_TIMEOUT_SECONDS,
+                retries={"max_attempts": settings.BEDROCK_MAX_RETRIES + 1, "mode": "standard"},
+            )
+            self._client = boto3.client(
+                "bedrock-runtime",
+                region_name=settings.AWS_REGION,
+                config=boto_config,
+            )
+        return self._client
+
+    def _get_openai_client(self):
+        """Only constructed when OPENAI_FALLBACK_ENABLED=true and key is present."""
+        if self._openai_client is None:
+            from openai import OpenAI  # type: ignore
+            self._openai_client = OpenAI(api_key=settings.OPENAI_API_KEY)
+        return self._openai_client
+
+    def invoke(
+        self,
+        prompt: str,
+        system_prompt: Optional[str] = None,
+        max_tokens: int = 4096,
+        temperature: float = 0.1,
+        request_id: Optional[str] = None,
+    ) -> str:
+        """
+        Invoke the configured AI provider and return the text response.
+
+        Raises a dict (safe error response) on any failure — never a raw exception.
+        """
+        rid = request_id or str(uuid.uuid4())
+        provider = settings.AI_PROVIDER
+
+        logger.info(
+            "AI invocation starting",
+            extra={
+                "request_id": rid,
+                "provider": provider,
+                "model": (
+                    settings.BEDROCK_MODEL_ID if provider == "bedrock"
+                    else settings.OPENAI_MODEL
+                ),
+            },
+        )
+
+        try:
+            if provider == "bedrock":
+                return self._invoke_bedrock(prompt, system_prompt, max_tokens, temperature, rid)
+            elif provider == "openai":
+                return self._invoke_openai(prompt, system_prompt, max_tokens, temperature, rid)
+            else:
+                raise ValueError(f"Unknown AI_PROVIDER: {provider}")
+
+        except _SafeError:
+            raise
+        except Exception as exc:
+            code = classify_provider_exception(exc)
+
+            # If Bedrock fails and fallback is explicitly enabled, try OpenAI
+            if (
+                provider == "bedrock"
+                and settings.OPENAI_FALLBACK_ENABLED
+                and settings.OPENAI_API_KEY
+                and code != ErrorCode.AI_PROVIDER_ACCESS_DENIED
+            ):
+                logger.warning(
+                    "Bedrock failed; attempting OpenAI fallback",
+                    extra={"request_id": rid, "bedrock_error_code": code},
+                )
+                try:
+                    result = self._invoke_openai(prompt, system_prompt, max_tokens, temperature, rid)
+                    logger.info(
+                        "OpenAI fallback succeeded",
+                        extra={"request_id": rid},
+                    )
+                    return result
+                except Exception as fallback_exc:
+                    fallback_code = classify_provider_exception(fallback_exc)
+                    logger.error(
+                        "OpenAI fallback also failed",
+                        extra={"request_id": rid, "fallback_error_code": fallback_code},
+                    )
+                    raise _SafeError(build_error_response(fallback_code, rid)) from fallback_exc
+
+            # Log sanitised error — do NOT log raw exception message at INFO
+            logger.error(
+                "AI provider invocation failed",
+                extra={
+                    "request_id": rid,
+                    "provider": provider,
+                    "error_code": code,
+                    "exc_type": type(exc).__name__,
+                },
+            )
+            raise _SafeError(build_error_response(code, rid)) from exc
+
+    def _invoke_bedrock(
+        self,
+        prompt: str,
+        system_prompt: Optional[str],
+        max_tokens: int,
+        temperature: float,
+        request_id: str,
+    ) -> str:
+        client = self._get_bedrock_client()
+        model_id = settings.BEDROCK_MODEL_ID
+
+        messages = [{"role": "user", "content": prompt}]
+        body: dict = {
+            "anthropic_version": "bedrock-2023-05-31",
+            "max_tokens": max_tokens,
+            "temperature": temperature,
+            "messages": messages,
+        }
+        if system_prompt:
+            body["system"] = system_prompt
+
+        try:
+            response = client.invoke_model(
+                modelId=model_id,
+                body=json.dumps(body),
+                contentType="application/json",
+                accept="application/json",
+            )
+            result = json.loads(response["body"].read())
+            text = result["content"][0]["text"]
+            logger.info(
+                "Bedrock invocation succeeded",
+                extra={
+                    "request_id": request_id,
+                    "model": model_id,
+                    "output_tokens": result.get("usage", {}).get("output_tokens", 0),
+                },
+            )
+            return text
+
+        except (NoCredentialsError, NoRegionError) as exc:
+            logger.error(
+                "Bedrock credential/region error",
+                extra={"request_id": request_id, "exc_type": type(exc).__name__},
+            )
+            raise
+
+        except (EndpointConnectionError, ReadTimeoutError) as exc:
+            logger.error(
+                "Bedrock connectivity error",
+                extra={"request_id": request_id, "exc_type": type(exc).__name__},
+            )
+            raise
+
+        except ClientError as exc:
+            # ClientError carries the HTTP status and error code
+            error_code = exc.response.get("Error", {}).get("Code", "")
+            logger.error(
+                "Bedrock ClientError",
+                extra={
+                    "request_id": request_id,
+                    "aws_error_code": error_code,
+                },
+            )
+            raise
+
+    def _invoke_openai(
+        self,
+        prompt: str,
+        system_prompt: Optional[str],
+        max_tokens: int,
+        temperature: float,
+        request_id: str,
+    ) -> str:
+        client = self._get_openai_client()
+        messages = []
+        if system_prompt:
+            messages.append({"role": "system", "content": system_prompt})
+        messages.append({"role": "user", "content": prompt})
+
+        response = client.chat.completions.create(
+            model=settings.OPENAI_MODEL,
+            messages=messages,
+            max_tokens=max_tokens,
+            temperature=temperature,
+        )
+        text = response.choices[0].message.content
+        logger.info(
+            "OpenAI invocation succeeded",
+            extra={
+                "request_id": request_id,
+                "model": settings.OPENAI_MODEL,
+                "usage_total_tokens": getattr(response.usage, "total_tokens", 0),
+            },
+        )
+        return text
+
+    def check_availability(self) -> dict:
+        """
+        Perform a lightweight probe to confirm the AI provider is reachable.
+        Returns a safe status dict — never raises.
+        """
+        try:
+            if settings.AI_PROVIDER == "bedrock":
+                client = self._get_bedrock_client()
+                # Probe with a minimal prompt
+                test_body = json.dumps({
+                    "anthropic_version": "bedrock-2023-05-31",
+                    "max_tokens": 10,
+                    "temperature": 0.0,
+                    "messages": [{"role": "user", "content": "ping"}],
+                })
+                client.invoke_model(
+                    modelId=settings.BEDROCK_MODEL_ID,
+                    body=test_body,
+                    contentType="application/json",
+                    accept="application/json",
+                )
+                return {"status": "available", "provider": "bedrock"}
+            else:
+                # For non-Bedrock, skip live probe — just confirm config
+                if settings.OPENAI_API_KEY:
+                    return {"status": "available", "provider": "openai"}
+                return {"status": "misconfigured", "provider": "openai"}
+        except Exception as exc:
+            code = classify_provider_exception(exc)
+            return {"status": "unavailable", "provider": settings.AI_PROVIDER, "error_code": code}
+
+
+class _SafeError(Exception):
+    """Internal sentinel — carries a safe error response dict."""
+    def __init__(self, response: dict) -> None:
+        self.response = response
+        super().__init__(response["error"]["code"])
+
+
+# Module-level singleton
+bedrock_client = BedrockClient()
