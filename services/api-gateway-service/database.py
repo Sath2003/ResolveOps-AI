@@ -19,7 +19,9 @@ class MockDynamoTable:
         db = SessionLocal()
         try:
             # Simple merge: will insert or update based on PK
-            instance = self.model(**Item)
+            model_cols = {c.name for c in self.model.__table__.columns} if hasattr(self.model, '__table__') else set()
+            filtered_item = {k: v for k, v in Item.items() if not model_cols or k in model_cols}
+            instance = self.model(**filtered_item)
             db.merge(instance)
             db.commit()
         finally:

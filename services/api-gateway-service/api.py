@@ -229,9 +229,8 @@ def register_user(user: UserAuth):
             'api_key': default_key,
             'user_id': user_id,
             'tenant_id': user_id,
-            'email': user.email,
             'name': "Default Integration Key",
-            'is_active': True,
+            'status': "active",
             'created_at': datetime.datetime.utcnow().isoformat()
         })
         
@@ -301,9 +300,9 @@ def generate_api_key(current_user: dict = Depends(get_current_user)):
     keys_table.put_item(Item={
         'api_key': new_key_str,
         'user_id': current_user.get("user_id"),
-        'email': current_user.get("email"),
+        'tenant_id': current_user.get("user_id"),
         'name': key_name,
-        'is_active': True,
+        'status': "active",
         'created_at': datetime.datetime.utcnow().isoformat()
     })
     
