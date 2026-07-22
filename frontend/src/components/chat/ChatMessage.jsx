@@ -23,20 +23,34 @@ function MermaidDiagram({ code }) {
 
   useEffect(() => {
     if (containerRef.current && code) {
+      // Auto-sanitize common LLM Mermaid syntax quirks
+      const cleanedCode = code
+        .replace(/-->\|([^|]+)\|>/g, "-->|$1|")
+        .replace(/->\|([^|]+)\|>/g, "-->|$1|")
+        .replace(/-->\|([^|]+)\| >/g, "-->|$1|");
+
       const id = `mermaid-${Math.random().toString(36).substring(2, 9)}`;
-      mermaid.render(id, code).then(({ svg }) => {
+      mermaid.render(id, cleanedCode).then(({ svg }) => {
         if (containerRef.current) {
           containerRef.current.innerHTML = svg;
         }
       }).catch((err) => {
-        if (containerRef.current) {
-          containerRef.current.innerHTML = `<pre class="text-rose-400 text-xs font-mono p-2 bg-black/40 rounded">${code}</pre>`;
-        }
+        // Fallback retry with basic graph layout if render failed
+        const fallbackCode = cleanedCode.replace(/\|([^|]+)\|/g, '');
+        mermaid.render(`${id}-fb`, fallbackCode).then(({ svg }) => {
+          if (containerRef.current) {
+            containerRef.current.innerHTML = svg;
+          }
+        }).catch(() => {
+          if (containerRef.current) {
+            containerRef.current.innerHTML = `<pre class="text-amber-400/90 text-xs font-mono p-3 bg-black/50 border border-amber-500/20 rounded-xl overflow-x-auto">${cleanedCode}</pre>`;
+          }
+        });
       });
     }
   }, [code]);
 
-  return <div ref={containerRef} className="my-3 p-3 bg-[#030712] border border-white/10 rounded-xl overflow-x-auto flex justify-center" />;
+  return <div ref={containerRef} className="my-3 p-4 bg-[#030712] border border-white/10 rounded-xl overflow-x-auto flex justify-center shadow-lg" />;
 }
 
 function timeAgo(iso) {
