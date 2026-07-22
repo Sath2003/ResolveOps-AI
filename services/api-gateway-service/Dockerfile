@@ -5,7 +5,7 @@ RUN pip install --no-cache-dir -r requirements.txt
 RUN groupadd -g 10001 appuser && useradd -u 10001 -g appuser -m -s /bin/bash appuser
 COPY --chown=appuser:appuser . .
 USER 10001
-CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8000"]
+CMD ["uvicorn", "api:app", "--host", "0.0.0.0", "--port", "8000"]
 
 # Trigger initial CI/CD build
 

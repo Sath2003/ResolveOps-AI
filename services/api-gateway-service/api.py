@@ -2206,6 +2206,23 @@ async def aws_connect(req: Request, current_user: dict = Depends(get_current_use
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
+def resolve_aws_status(tenant_email: str) -> dict:
+    from database import get_user_integrations
+    integrations = get_user_integrations(tenant_email)
+    aws_data = integrations.get("aws", {})
+    connected = bool(aws_data.get("connected"))
+    return {
+        "saved": connected,
+        "validated": connected,
+        "connected": connected,
+        "has_credentials": connected,
+        "status": "connected" if connected else "disconnected",
+        "provider": "aws",
+        "account_id": aws_data.get("account_id"),
+        "region": aws_data.get("region", "us-east-1")
+    }
+
+@app.get("/api/v1/integrations")
 @app.get("/api/v1/integrations/status")
 def integrations_status(current_user: dict = Depends(get_current_user)):
     try:
@@ -2778,22 +2795,6 @@ async def github_workflow_dispatch_proxy(owner: str, repo: str, workflow_id: str
         return JSONResponse(status_code=res.status_code, content={"message": res.text})
     return res.json()
 
-@app.api_route("/api/v1/aws/{path:path}", methods=["GET", "POST", "PUT", "DELETE", "PATCH"])
-async def proxy_aws_requests(path: str, request: Request, current_user: dict = Depends(get_current_user)):
-    """
-    Proxies all AWS intelligence requests to aws-intelligence-service.
-    Injects AWS credentials from the central integration state as headers.
-    """
-    tenant_email = current_user.get("email")
-    integrations = get_user_integrations(tenant_email)
-    
-    aws_creds = integrations.get("aws", {}).get("credentials", {})
-    aws_region = integrations.get("aws", {}).get("region", "us-east-1")
-    
-    access_key = aws_creds.get("access_key_id", "")
-    secret_key = aws_creds.get("secret_access_key", "")
-    session_token = aws_creds.get("session_token", "")
-
 @app.get("/api/v1/analytics/overview")
 async def get_analytics_overview(current_user: dict = Depends(get_current_user)):
     """
@@ -2905,6 +2906,22 @@ async def get_analytics_overview(current_user: dict = Depends(get_current_user))
         "services": services_list,
         "incidents": all_incidents[:10],
     }
+
+@app.api_route("/api/v1/aws/{path:path}", methods=["GET", "POST", "PUT", "DELETE", "PATCH"])
+async def proxy_aws_requests(path: str, request: Request, current_user: dict = Depends(get_current_user)):
+    """
+    Proxies all AWS intelligence requests to aws-intelligence-service.
+    Injects AWS credentials from the central integration state as headers.
+    """
+    tenant_email = current_user.get("email")
+    integrations = get_user_integrations(tenant_email)
+    
+    aws_creds = integrations.get("aws", {}).get("credentials", {})
+    aws_region = integrations.get("aws", {}).get("region", "us-east-1")
+    
+    access_key = aws_creds.get("access_key_id", "")
+    secret_key = aws_creds.get("secret_access_key", "")
+    session_token = aws_creds.get("session_token", "")
     
     headers = dict(request.headers)
     headers.pop("host", None)
