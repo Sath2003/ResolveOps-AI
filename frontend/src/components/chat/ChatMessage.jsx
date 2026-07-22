@@ -1,8 +1,43 @@
 "use client";
 
-import { useState } from "react";
+import { useState, useEffect, useRef } from "react";
 import { User, Bot, AlertTriangle, RefreshCw, Copy, CheckCircle2, XCircle, ChevronDown, ChevronRight, Shield, Zap, Clock, Info } from "lucide-react";
 import ReactMarkdown from "react-markdown";
+import mermaid from "mermaid";
+
+mermaid.initialize({
+  startOnLoad: false,
+  theme: "dark",
+  themeVariables: {
+    primaryColor: "#4f46e5",
+    primaryTextColor: "#f8fafc",
+    primaryBorderColor: "#6366f1",
+    lineColor: "#818cf8",
+    secondaryColor: "#0f172a",
+    tertiaryColor: "#1e293b"
+  }
+});
+
+function MermaidDiagram({ code }) {
+  const containerRef = useRef(null);
+
+  useEffect(() => {
+    if (containerRef.current && code) {
+      const id = `mermaid-${Math.random().toString(36).substring(2, 9)}`;
+      mermaid.render(id, code).then(({ svg }) => {
+        if (containerRef.current) {
+          containerRef.current.innerHTML = svg;
+        }
+      }).catch((err) => {
+        if (containerRef.current) {
+          containerRef.current.innerHTML = `<pre class="text-rose-400 text-xs font-mono p-2 bg-black/40 rounded">${code}</pre>`;
+        }
+      });
+    }
+  }, [code]);
+
+  return <div ref={containerRef} className="my-3 p-3 bg-[#030712] border border-white/10 rounded-xl overflow-x-auto flex justify-center" />;
+}
 
 function timeAgo(iso) {
   if (!iso) return "";
@@ -56,9 +91,25 @@ export function MessageBubble({ msg, onRetry }) {
           <div className="prose-sm max-w-none text-sm leading-relaxed">
             <ReactMarkdown
               components={{
-                code: ({ ...props }) => (
-                  <code className="bg-slate-800 text-indigo-300 px-1 py-0.5 rounded text-xs font-mono" {...props} />
-                ),
+                code({ inline, className, children, ...props }) {
+                  const match = /language-(\w+)/.exec(className || "");
+                  const language = match ? match[1] : "";
+                  const codeString = String(children).replace(/\n$/, "");
+
+                  if (!inline && language === "mermaid") {
+                    return <MermaidDiagram code={codeString} />;
+                  }
+
+                  return inline ? (
+                    <code className="bg-slate-800 text-indigo-300 px-1 py-0.5 rounded text-xs font-mono" {...props}>
+                      {children}
+                    </code>
+                  ) : (
+                    <code className="block text-xs font-mono text-slate-300" {...props}>
+                      {children}
+                    </code>
+                  );
+                },
                 pre: ({ children }) => (
                   <pre className="bg-[#020617] border border-white/10 rounded-lg p-3 overflow-x-auto font-mono text-xs text-slate-300 my-2">
                     {children}

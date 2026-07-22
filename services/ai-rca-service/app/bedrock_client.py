@@ -179,15 +179,6 @@ class BedrockClient:
                 },
             )
             return text
-
-        except (NoCredentialsError, NoRegionError) as exc:
-            logger.error(
-                "Bedrock credential/region error",
-                extra={"request_id": request_id, "exc_type": type(exc).__name__},
-            )
-            raise
-
-        except (EndpointConnectionError, ReadTimeoutError) as exc:
             logger.error(
                 "Bedrock connectivity error",
                 extra={"request_id": request_id, "exc_type": type(exc).__name__},
@@ -236,6 +227,46 @@ class BedrockClient:
             },
         )
         return text
+
+    def generate_diagram_image(self, prompt: str, request_id: Optional[str] = None) -> Optional[str]:
+        """
+        Generate an architecture diagram image using Amazon Titan Image Generator v2.
+        Returns a base64 data URI string (data:image/png;base64,...) or None on fallback.
+        """
+        rid = request_id or str(uuid.uuid4())
+        try:
+            client = self._get_bedrock_client()
+            diagram_prompt = f"Professional technical cloud architecture diagram, sleek dark mode theme, SRE topology: {prompt}"
+            body = json.dumps({
+                "taskType": "TEXT_IMAGE",
+                "textToImageParams": {
+                    "text": diagram_prompt[:512]
+                },
+                "imageGenerationConfig": {
+                    "numberOfImages": 1,
+                    "quality": "standard",
+                    "height": 512,
+                    "width": 512,
+                    "cfgScale": 8.0
+                }
+            })
+            response = client.invoke_model(
+                modelId="amazon.titan-image-generator-v2:0",
+                body=body,
+                contentType="application/json",
+                accept="application/json"
+            )
+            res_body = json.loads(response["body"].read())
+            images = res_body.get("images", [])
+            if images:
+                logger.info("Amazon Titan diagram image generated successfully", extra={"request_id": rid})
+                return f"data:image/png;base64,{images[0]}"
+        except Exception as exc:
+            logger.warning(
+                "Amazon Titan Image Generator unavailable or unpermitted; proceeding without AI image",
+                extra={"request_id": rid, "error": str(exc)}
+            )
+        return None
 
     def check_availability(self) -> dict:
         """

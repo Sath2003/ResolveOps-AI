@@ -221,6 +221,17 @@ class InvestigationOrchestrator:
                 temperature=0.3,
                 request_id=request_id,
             )
+
+            # Check if user requested a visual architecture diagram image
+            msg_lower = message.lower()
+            if any(k in msg_lower for k in ["diagram", "architecture image", "draw architecture", "visual topology", "generate image"]):
+                data_uri = await asyncio.to_thread(
+                    bedrock_client.generate_diagram_image,
+                    message,
+                    request_id
+                )
+                if data_uri:
+                    answer += f"\n\n### 🎨 Generated Architecture Diagram\n![Architecture Diagram]({data_uri})"
         except _SafeError as exc:
             # Return structured error for chat — caller renders friendly card
             return {
