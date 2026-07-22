@@ -110,13 +110,9 @@ export async function fetchApi(endpoint, options = {}) {
     }
 
     if (response.status === 401) {
-      const isAuthEndpoint = path.startsWith('/v1/auth') || path === '/me' || path.includes('/auth/');
-      const isSessionExpired = errorData.error_code === 'session_expired';
-      if (isAuthEndpoint || isSessionExpired) {
-        if (typeof window !== 'undefined') {
-          localStorage.removeItem('jwt_token');
-          window.location.href = '/login';
-        }
+      if (typeof window !== 'undefined') {
+        localStorage.removeItem('jwt_token');
+        window.location.href = '/login';
       }
     }
     

@@ -275,9 +275,9 @@ def get_current_user(credentials: HTTPAuthorizationCredentials = Depends(securit
         payload = jwt.decode(credentials.credentials, JWT_SECRET, algorithms=["HS256"])
         return payload  # Contains user_id and email
     except jwt.ExpiredSignatureError:
-        raise HTTPException(status_code=401, detail="Token expired")
+        raise HTTPException(status_code=401, detail={"message": "Session expired. Please log in again.", "error_code": "session_expired"})
     except jwt.InvalidTokenError:
-        raise HTTPException(status_code=401, detail="Invalid token")
+        raise HTTPException(status_code=401, detail={"message": "Invalid token. Please log in again.", "error_code": "session_expired"})
 
 @app.get("/api/keys", response_model=List[ApiKeyResponse])
 def get_api_keys(current_user: dict = Depends(get_current_user)):
