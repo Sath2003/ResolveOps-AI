@@ -54,12 +54,13 @@ async def lifespan(app: FastAPI):
     for w in warnings:
         logger.warning("Configuration warning", extra={"detail": w})
 
+    openai_key_configured = bool(settings.OPENAI_API_KEY)
     logger.info(
         "AI-RCA service starting",
         extra={
             "provider": settings.AI_PROVIDER,
-            "model": settings.BEDROCK_MODEL_ID,
-            "region": settings.AWS_REGION,
+            "model": settings.OPENAI_MODEL if settings.AI_PROVIDER == "openai" else settings.BEDROCK_MODEL_ID,
+            "openai_api_key_configured": openai_key_configured,
             "mcp_enabled": settings.MCP_RCA_ENABLED,
             "chat_via_rca": settings.AI_RCA_CHAT_ENABLED,
             "fallback_enabled": settings.OPENAI_FALLBACK_ENABLED,

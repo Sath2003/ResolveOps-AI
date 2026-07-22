@@ -45,8 +45,7 @@ _USER_MESSAGES: dict[str, str] = {
         "issue. Please contact the administrator."
     ),
     ErrorCode.AI_PROVIDER_CONFIGURATION_ERROR: (
-        "The AI provider is not correctly configured. "
-        "Please contact the administrator."
+        "The OpenAI provider is not configured correctly."
     ),
     ErrorCode.AI_RESPONSE_INVALID: (
         "The AI service returned an unexpected response. Please retry."

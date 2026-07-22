@@ -91,9 +91,11 @@ class BedrockClient:
             if provider == "bedrock":
                 return self._invoke_bedrock(prompt, system_prompt, max_tokens, temperature, rid)
             elif provider == "openai":
+                if not settings.OPENAI_API_KEY or not settings.OPENAI_MODEL:
+                    raise _SafeError(build_error_response(ErrorCode.AI_PROVIDER_CONFIGURATION_ERROR, rid))
                 return self._invoke_openai(prompt, system_prompt, max_tokens, temperature, rid)
             else:
-                raise ValueError(f"Unknown AI_PROVIDER: {provider}")
+                raise _SafeError(build_error_response(ErrorCode.AI_PROVIDER_CONFIGURATION_ERROR, rid))
 
         except _SafeError:
             raise

@@ -76,11 +76,10 @@ function ProviderBadge({ providerStatus, loading }) {
     );
   }
 
-  const { provider, model, status } = providerStatus || {};
+  const { provider, display_name, status } = providerStatus || {};
   const isAvailable = status === "available";
-  const displayProvider = provider === "bedrock" ? "Amazon Bedrock"
-    : provider === "openai" ? "OpenAI"
-    : provider || "AI";
+  const name = display_name || (provider === "openai" ? "OpenAI" : provider === "bedrock" ? "Amazon Bedrock" : provider || "AI");
+  const badgeText = isAvailable ? `${name} — Active` : `${name} — Degraded`;
 
   return (
     <div className={`flex items-center gap-1.5 px-2.5 py-1 rounded-full border text-[11px] font-medium ${
@@ -91,7 +90,7 @@ function ProviderBadge({ providerStatus, loading }) {
       {isAvailable
         ? <CheckCircle2 size={11} />
         : <AlertTriangle size={11} />}
-      {isAvailable ? `Powered by ${displayProvider}` : "AI Degraded"}
+      {badgeText}
     </div>
   );
 }
