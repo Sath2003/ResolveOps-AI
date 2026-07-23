@@ -112,6 +112,61 @@ function formatAndSanitizeMermaidCode(code) {
   return text;
 }
 
+function fitSVGToViewBox(rawSvg) {
+  if (typeof document === "undefined" || !rawSvg) return rawSvg;
+
+  try {
+    const tempContainer = document.createElement("div");
+    tempContainer.style.position = "absolute";
+    tempContainer.style.visibility = "hidden";
+    tempContainer.style.top = "-9999px";
+    tempContainer.style.left = "-9999px";
+    tempContainer.style.width = "1200px";
+    tempContainer.innerHTML = rawSvg;
+    document.body.appendChild(tempContainer);
+
+    const svgElem = tempContainer.querySelector("svg");
+    if (svgElem) {
+      // 1. Remove restrictive max-width / height attributes & inline style
+      svgElem.removeAttribute("style");
+      svgElem.setAttribute("style", "width: 100%; height: auto; display: block; margin: 0 auto;");
+      svgElem.setAttribute("width", "100%");
+      svgElem.removeAttribute("height");
+
+      // 2. Query root group & calculate actual BBox
+      const rootGroup = svgElem.querySelector("g");
+      if (rootGroup && typeof rootGroup.getBBox === "function") {
+        const bbox = rootGroup.getBBox();
+
+        console.log("[Mermaid Viewport Diagnostics]", {
+          svgViewBox: svgElem.getAttribute("viewBox"),
+          svgWidth: svgElem.getAttribute("width"),
+          svgHeight: svgElem.getAttribute("height"),
+          svgRect: svgElem.getBoundingClientRect(),
+          groupBBox: bbox,
+          groupTransform: rootGroup.getAttribute("transform"),
+        });
+
+        if (bbox && bbox.width > 0 && bbox.height > 0) {
+          const padding = 24;
+          const minX = bbox.x - padding;
+          const minY = bbox.y - padding;
+          const width = bbox.width + padding * 2;
+          const height = bbox.height + padding * 2;
+          svgElem.setAttribute("viewBox", `${minX} ${minY} ${width} ${height}`);
+        }
+      }
+    }
+
+    const processedSvg = tempContainer.innerHTML;
+    document.body.removeChild(tempContainer);
+    return processedSvg;
+  } catch (err) {
+    console.warn("SVG viewBox auto-fit fallback:", err);
+    return rawSvg;
+  }
+}
+
 function MermaidDiagram({ code }) {
   const [mounted, setMounted] = useState(false);
   const [svgHtml, setSvgHtml] = useState(null);
@@ -139,18 +194,20 @@ function MermaidDiagram({ code }) {
 
     const renderDiagram = async () => {
       try {
-        const { svg } = await mermaid.render(diagramId, formattedCode);
+        const { svg: rawSvg } = await mermaid.render(diagramId, formattedCode);
         if (isSubscribed) {
-          setSvgHtml(injectSVGStyles(svg));
+          const autoFittedSvg = fitSVGToViewBox(rawSvg);
+          setSvgHtml(injectSVGStyles(autoFittedSvg));
           setLoading(false);
         }
       } catch (primaryErr) {
         console.warn("Primary Mermaid render failed, trying simplified fallback...", primaryErr);
         try {
           const fallbackCode = formattedCode.replace(/\|([^|]+)\|/g, '');
-          const { svg } = await mermaid.render(`${diagramId}-fb`, fallbackCode);
+          const { svg: rawSvg } = await mermaid.render(`${diagramId}-fb`, fallbackCode);
           if (isSubscribed) {
-            setSvgHtml(injectSVGStyles(svg));
+            const autoFittedSvg = fitSVGToViewBox(rawSvg);
+            setSvgHtml(injectSVGStyles(autoFittedSvg));
             setLoading(false);
           }
         } catch (fallbackErr) {
