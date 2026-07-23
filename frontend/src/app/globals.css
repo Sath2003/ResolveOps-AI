@@ -127,29 +127,33 @@
   margin: 0 auto !important;
 }
 
-.mermaid-svg-container svg text,
-.mermaid-svg-container svg .nodeLabel,
-.mermaid-svg-container svg .cluster-label {
-  fill: #f8fafc !important;
-  color: #f8fafc !important;
-  font-family: ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif !important;
-  font-size: 13px !important;
-  font-weight: 600 !important;
+.mermaid-svg-container svg g.cluster > rect,
+.mermaid-svg-container svg .cluster > rect {
+  fill: #0f172a !important;
+  stroke: #334155 !important;
+  stroke-width: 1.5px !important;
 }
 
-.mermaid-svg-container svg .node rect,
-.mermaid-svg-container svg .node circle,
-.mermaid-svg-container svg .node polygon,
-.mermaid-svg-container svg .node path {
+.mermaid-svg-container svg g.node rect,
+.mermaid-svg-container svg g.node circle,
+.mermaid-svg-container svg g.node polygon,
+.mermaid-svg-container svg g.node path,
+.mermaid-svg-container svg .node rect {
   fill: #1e1b4b !important;
   stroke: #6366f1 !important;
   stroke-width: 2px !important;
 }
 
-.mermaid-svg-container svg .cluster rect {
-  fill: #0f172a !important;
-  stroke: #334155 !important;
-  stroke-width: 1.5px !important;
+.mermaid-svg-container svg text,
+.mermaid-svg-container svg foreignObject,
+.mermaid-svg-container svg foreignObject *,
+.mermaid-svg-container svg .nodeLabel,
+.mermaid-svg-container svg .cluster-label {
+  fill: #ffffff !important;
+  color: #ffffff !important;
+  font-family: ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif !important;
+  font-size: 13px !important;
+  font-weight: 600 !important;
 }
 
 .mermaid-svg-container svg .edgePath path,

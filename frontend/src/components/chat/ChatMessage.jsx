@@ -25,7 +25,20 @@ function injectSVGStyles(rawSvg) {
 
   const customStyle = `<style>
     svg { max-width: 100% !important; height: auto !important; display: block !important; margin: 0 auto !important; background: transparent !important; }
-    foreignObject, foreignObject *, .nodeLabel, .cluster-label, text, tspan, span, div {
+    
+    g.cluster > rect, .cluster > rect {
+      fill: #0f172a !important;
+      stroke: #334155 !important;
+      stroke-width: 1.5px !important;
+    }
+
+    g.node rect, g.node circle, g.node polygon, g.node path, .node rect {
+      fill: #1e1b4b !important;
+      stroke: #6366f1 !important;
+      stroke-width: 2px !important;
+    }
+
+    foreignObject, foreignObject *, .nodeLabel, .cluster-label, text, tspan, span {
       fill: #ffffff !important;
       color: #ffffff !important;
       font-family: ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif !important;
@@ -34,24 +47,17 @@ function injectSVGStyles(rawSvg) {
       opacity: 1 !important;
       visibility: visible !important;
     }
-    .node rect, .node circle, .node polygon, .node path {
-      fill: #1e1b4b !important;
-      stroke: #6366f1 !important;
-      stroke-width: 2px !important;
-    }
-    .cluster rect {
-      fill: #0f172a !important;
-      stroke: #334155 !important;
-      stroke-width: 1.5px !important;
-    }
+
     .edgePath path, .flowchart-link {
       stroke: #818cf8 !important;
       stroke-width: 2px !important;
     }
+
     .edgeLabel rect {
       fill: #090d16 !important;
       stroke: #374151 !important;
     }
+
     .edgeLabel text, .edgeLabel span {
       fill: #a5b4fc !important;
       color: #a5b4fc !important;
