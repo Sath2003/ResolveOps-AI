@@ -120,18 +120,27 @@
 
 /* Mermaid High-Contrast Dark Mode Enhancements */
 .mermaid-svg-container svg {
+  width: 100% !important;
   max-width: 100% !important;
   height: auto !important;
-  min-height: 180px !important;
+  min-height: 260px !important;
   display: block !important;
   margin: 0 auto !important;
 }
 
 .mermaid-svg-container svg g.cluster > rect,
-.mermaid-svg-container svg .cluster > rect {
+.mermaid-svg-container svg .cluster > rect,
+.mermaid-svg-container svg g.cluster rect {
   fill: #0f172a !important;
   stroke: #334155 !important;
   stroke-width: 1.5px !important;
+}
+
+.mermaid-svg-container svg g.cluster > rect.inner,
+.mermaid-svg-container svg .cluster rect.inner,
+.mermaid-svg-container svg rect.inner {
+  fill: transparent !important;
+  stroke: none !important;
 }
 
 .mermaid-svg-container svg g.node rect,

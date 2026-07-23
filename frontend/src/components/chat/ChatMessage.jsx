@@ -11,7 +11,7 @@ mermaid.initialize({
   securityLevel: "loose",
   theme: "base",
   flowchart: {
-    useMaxWidth: true,
+    useMaxWidth: false,
     htmlLabels: true,
     curve: "basis"
   },
@@ -32,16 +32,33 @@ mermaid.initialize({
 function injectSVGStyles(rawSvg) {
   if (!rawSvg) return "";
 
+  let svg = rawSvg;
+
+  // 1. Remove Mermaid v11 inline max-width: 0px or height: 0px style collapse
+  svg = svg.replace(/style="([^"]*)"/gi, (match, styleContent) => {
+    const cleanedStyle = styleContent
+      .replace(/max-width:\s*0px;?/gi, '')
+      .replace(/height:\s*0px;?/gi, '');
+    return `style="width: 100%; height: auto; ${cleanedStyle}"`;
+  });
+
+  // 2. Ensure svg root has width="100%"
+  svg = svg.replace(/<svg\s+([^>]*)/i, (match, attrs) => {
+    let newAttrs = attrs;
+    if (!/width=/i.test(newAttrs)) newAttrs += ' width="100%"';
+    return `<svg ${newAttrs}`;
+  });
+
   const customStyle = `<style>
-    svg { max-width: 100% !important; height: auto !important; display: block !important; margin: 0 auto !important; background: transparent !important; }
+    svg { max-width: 100% !important; width: 100% !important; height: auto !important; min-height: 260px !important; display: block !important; margin: 0 auto !important; background: transparent !important; }
     
-    g.cluster > rect, .cluster > rect {
+    g.cluster > rect, .cluster > rect, g.cluster rect {
       fill: #0f172a !important;
       stroke: #334155 !important;
       stroke-width: 1.5px !important;
     }
 
-    g.cluster > rect.inner, .cluster rect.inner, rect.inner {
+    g.cluster > rect.inner, .cluster rect.inner, rect.inner, g.cluster .inner {
       fill: transparent !important;
       stroke: none !important;
     }
@@ -52,7 +69,7 @@ function injectSVGStyles(rawSvg) {
       stroke-width: 2px !important;
     }
 
-    foreignObject, foreignObject *, .nodeLabel, .cluster-label, text, tspan, span, p, div {
+    foreignObject, foreignObject *, .nodeLabel, .cluster-label, text, tspan, span, p {
       fill: #ffffff !important;
       color: #ffffff !important;
       font-family: ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif !important;
@@ -80,7 +97,7 @@ function injectSVGStyles(rawSvg) {
     }
   </style>`;
 
-  return rawSvg.replace(/<svg[^>]*>/, (match) => `${match}${customStyle}`);
+  return svg.replace(/<svg[^>]*>/, (match) => `${match}${customStyle}`);
 }
 
 function formatAndSanitizeMermaidCode(code) {
