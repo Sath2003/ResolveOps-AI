@@ -409,26 +409,33 @@ class InvestigationOrchestrator:
                 },
             )
             try:
-                fallback_answer = await asyncio.to_thread(
-                    _invoke,
-                    message,
-                    _CHAT_SYSTEM_PROMPT,
-                    2048,
-                    0.3,
-                )
+                explanation = await self._generate_explanation_text_only(message, _invoke)
             except Exception:
-                fallback_answer = (
-                    "I couldn't generate a visual for this request. "
-                    "Please try rephrasing or ask for a different format."
-                )
+                explanation = {
+                    "introduction": "The visual request could not be processed into an architecture plan.",
+                    "sections": [],
+                    "key_takeaway": "Try requesting a simpler or explicit architecture diagram format."
+                }
+
+            error_body = {
+                "type": "visual_response",
+                "title": "Visual Planning Warning",
+                "introduction": explanation.get("introduction", ""),
+                "sections": explanation.get("sections", []),
+                "key_takeaway": explanation.get("key_takeaway", ""),
+                "visual": None,
+                "visual_error": {
+                    "error_code": "VISUAL_PLANNING_FAILED",
+                    "message": f"Planning errors: {'; '.join(plan_errors)}",
+                }
+            }
             return {
                 "request_id": request_id,
                 "session_id": session_id,
-                "answer": fallback_answer,
-                "execution_path": "visual_fallback_text",
-                "response_type": "TEXT",
+                "execution_path": "visual_planning_failed",
+                "response_type": intent.value,
                 "status": "success",
-                "visual_generation_error": "planning_failed",
+                "answer": _json.dumps(error_body),
             }
 
         logger.info(
@@ -546,35 +553,38 @@ class InvestigationOrchestrator:
                     "answer": _json.dumps(response_body),
                 }
             else:
-                logger.error(
+                logger.warning(
                     "visual_generation_stage",
                     extra={
                         "request_id": request_id,
                         "visual_id": visual_id,
-                        "stage": "api_gateway_response",
-                        "status": "failed",
+                        "stage": "image_provider_fallback",
+                        "status": "fallback_to_structured_diagram",
                         "error_code": meta.error_code,
                     },
                 )
-                error_body = {
+                # Fallback to structured SVG diagram (interactive auto-layout canvas)
+                structured_payload = self._spec_to_structured_diagram(spec)
+                response_body = {
                     "type": "visual_response",
-                    "title": spec.title,
+                    "title": f"{spec.title} (Interactive Diagram)",
                     "introduction": explanation.get("introduction", ""),
                     "sections": explanation.get("sections", []),
                     "key_takeaway": explanation.get("key_takeaway", ""),
-                    "visual": None,
-                    "visual_error": {
-                        "error_code": meta.error_code,
-                        "message": f"Visual generation failed: {meta.error_code}",
-                    }
+                    "visual": {
+                        "kind": "structured_diagram",
+                        "spec": structured_payload,
+                        "alt": spec.alt_text,
+                    },
+                    "visual_warning": f"Image provider issue ({meta.error_code}). Rendered as interactive diagram."
                 }
                 return {
                     "request_id": request_id,
                     "session_id": session_id,
-                    "execution_path": "generated_image_failed",
+                    "execution_path": "image_fallback_to_structured",
                     "response_type": intent.value,
                     "status": "success",
-                    "answer": _json.dumps(error_body),
+                    "answer": _json.dumps(response_body),
                 }
 
         # ── Fallback: unknown engine → text ───────────────────────────────────
@@ -601,6 +611,33 @@ class InvestigationOrchestrator:
             "execution_path": "ai_rca_chat",
             "status": "error",
             **error_payload,
+        }
+
+    async def _generate_explanation_text_only(
+        self, message: str, invoke_fn
+    ) -> Dict[str, Any]:
+        """Generate structured explanation JSON without requiring a VisualSpec."""
+        import json as _json
+        import re as _re
+
+        prompt = f"User question: {message}"
+        try:
+            raw = await asyncio.to_thread(
+                invoke_fn,
+                prompt,
+                _EXPLANATION_SYSTEM_PROMPT,
+                1500,
+                0.3,
+            )
+            match = _re.search(r'\{.*\}', raw, _re.DOTALL)
+            if match:
+                return _json.loads(match.group())
+        except Exception:
+            pass
+        return {
+            "introduction": f"Explanation for: {message}",
+            "sections": [],
+            "key_takeaway": "Architecture visual request."
         }
 
     def _spec_to_structured_diagram(self, spec) -> Dict[str, Any]:
