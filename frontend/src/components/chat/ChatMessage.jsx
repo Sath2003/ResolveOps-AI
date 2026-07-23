@@ -212,30 +212,35 @@ export function MessageBubble({ msg, onRetry }) {
           <div className="prose-sm max-w-none text-sm leading-relaxed">
             <ReactMarkdown
               components={{
-                code({ inline, className, children, ...props }) {
+                pre({ children }) {
+                  return <>{children}</>;
+                },
+                code({ className, children, node, ...props }) {
                   const match = /language-(\w+)/.exec(className || "");
                   const language = match ? match[1] : "";
                   const codeString = String(children).replace(/\n$/, "");
+                  const isInline = !className && !codeString.includes("\n");
 
-                  if (!inline && (language === "mermaid" || codeString.trim().startsWith("graph ") || codeString.trim().startsWith("flowchart "))) {
+                  if (language === "mermaid" || codeString.trim().startsWith("graph ") || codeString.trim().startsWith("flowchart ")) {
                     return <MermaidDiagram code={codeString} />;
                   }
 
-                  return inline ? (
-                    <code className="bg-slate-800 text-indigo-300 px-1 py-0.5 rounded text-xs font-mono" {...props}>
-                      {children}
-                    </code>
-                  ) : (
-                    <code className="block text-xs font-mono text-slate-300" {...props}>
-                      {children}
-                    </code>
+                  if (isInline) {
+                    return (
+                      <code className="bg-slate-800/80 text-indigo-300 px-1.5 py-0.5 rounded text-xs font-mono inline border border-indigo-500/20" {...props}>
+                        {children}
+                      </code>
+                    );
+                  }
+
+                  return (
+                    <pre className="bg-[#020617] border border-white/10 rounded-xl p-3 overflow-x-auto font-mono text-xs text-slate-300 my-2">
+                      <code className="text-xs font-mono text-slate-300" {...props}>
+                        {children}
+                      </code>
+                    </pre>
                   );
                 },
-                pre: ({ children }) => (
-                  <pre className="bg-[#020617] border border-white/10 rounded-lg p-3 overflow-x-auto font-mono text-xs text-slate-300 my-2">
-                    {children}
-                  </pre>
-                ),
                 ul: ({ ...props }) => <ul className="list-disc pl-5 space-y-1 my-2" {...props} />,
                 ol: ({ ...props }) => <ol className="list-decimal pl-5 space-y-1 my-2" {...props} />,
                 p: ({ ...props }) => <p className="mb-2 last:mb-0" {...props} />,
