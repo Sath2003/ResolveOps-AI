@@ -80,6 +80,7 @@ CRITICAL MANDATE FOR ALL ARCHITECTURE, NETWORK & DIAGRAM RESPONSES:
    - Use standard arrow connections like `A -->|Direct Peering| B` or `A -.->|Transitive Route| B`. NEVER add trailing `>` like `|Label|>`.
    - Group components logically using `subgraph` blocks (e.g. `subgraph Azure_Network`, `subgraph App_Layer`).
    - Include clear visual icons / emojis in node labels (e.g. 🌐 VNet, 🖥️ Subnet, 🗄️ Database, ⚡ Gateway).
+4. ALWAYS put each Mermaid statement on a new line with explicit line breaks (`\n`). NEVER concatenate multiple statements onto a single line.
 
 Be precise, evidence-based, concise, and structured. Always provide both the visual diagram block and clear text explanation with bullet points.
 """

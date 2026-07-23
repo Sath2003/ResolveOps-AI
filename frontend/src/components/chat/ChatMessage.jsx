@@ -1,7 +1,7 @@
 "use client";
 
 import { useState, useEffect, useRef } from "react";
-import { User, Bot, AlertTriangle, RefreshCw, Copy, CheckCircle2, XCircle, ChevronDown, ChevronRight, Shield, Zap, Clock, Info } from "lucide-react";
+import { User, Bot, AlertTriangle, RefreshCw, Copy, CheckCircle2, XCircle, ChevronDown, ChevronRight, Shield, Zap, Clock, Info, Activity } from "lucide-react";
 import ReactMarkdown from "react-markdown";
 import mermaid from "mermaid";
 
@@ -9,14 +9,23 @@ mermaid.initialize({
   startOnLoad: false,
   suppressErrorRendering: true,
   securityLevel: "loose",
-  theme: "dark",
+  theme: "base",
+  flowchart: {
+    useMaxWidth: true,
+    htmlLabels: true,
+    curve: "basis"
+  },
   themeVariables: {
+    darkMode: true,
+    background: "transparent",
     primaryColor: "#4f46e5",
-    primaryTextColor: "#f8fafc",
+    primaryTextColor: "#ffffff",
     primaryBorderColor: "#6366f1",
     lineColor: "#818cf8",
     secondaryColor: "#0f172a",
-    tertiaryColor: "#1e293b"
+    tertiaryColor: "#1e293b",
+    nodeTextColor: "#ffffff",
+    textColor: "#ffffff"
   }
 });
 
@@ -32,13 +41,18 @@ function injectSVGStyles(rawSvg) {
       stroke-width: 1.5px !important;
     }
 
-    g.node rect, g.node circle, g.node polygon, g.node path, .node rect {
+    g.cluster > rect.inner, .cluster rect.inner, rect.inner {
+      fill: transparent !important;
+      stroke: none !important;
+    }
+
+    g.node rect, g.node circle, g.node polygon, g.node path, .node rect, .node circle, .node polygon, .node path {
       fill: #1e1b4b !important;
       stroke: #6366f1 !important;
       stroke-width: 2px !important;
     }
 
-    foreignObject, foreignObject *, .nodeLabel, .cluster-label, text, tspan, span {
+    foreignObject, foreignObject *, .nodeLabel, .cluster-label, text, tspan, span, p, div {
       fill: #ffffff !important;
       color: #ffffff !important;
       font-family: ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif !important;
@@ -58,7 +72,7 @@ function injectSVGStyles(rawSvg) {
       stroke: #374151 !important;
     }
 
-    .edgeLabel text, .edgeLabel span {
+    .edgeLabel text, .edgeLabel span, .edgeLabel div {
       fill: #a5b4fc !important;
       color: #a5b4fc !important;
       font-size: 11px !important;
@@ -69,82 +83,179 @@ function injectSVGStyles(rawSvg) {
   return rawSvg.replace(/<svg[^>]*>/, (match) => `${match}${customStyle}`);
 }
 
+function formatAndSanitizeMermaidCode(code) {
+  if (!code) return "";
+  let text = code.trim();
+
+  // 1. If single-line or missing newlines between statements, restore newlines
+  if (!text.includes("\n") || text.split("\n").length < 3) {
+    text = text
+      .replace(/\s*(subgraph\s+[A-Za-z0-9_"\-[\]\s]+)/gi, "\n$1\n")
+      .replace(/\s*(end)(?=\s|$)/gi, "\nend\n")
+      .replace(/\s*(-->|->|-\.->|<-->)\s*/gi, " $1 ")
+      .replace(/\]\s*([A-Za-z0-9_]+)\[/g, "]\n$1[")
+      .replace(/("\s*)([A-Za-z0-9_]+\[)/g, '$1\n$2');
+  }
+
+  // 2. Fix arrow label quirks
+  text = text
+    .replace(/-->\|([^|]+)\|>/g, "-->|$1|")
+    .replace(/->\|([^|]+)\|>/g, "-->|$1|")
+    .replace(/-->\|([^|]+)\| >/g, "-->|$1|")
+    .replace(/<-->\|([^|]+)\|/g, "-->|$1|")
+    .replace(/style\s+\w+\s+fill:[^;\n]+;\s*/gi, "")
+    .replace(/style\s+\w+\s+fill:[^;\n]+$/gi, "");
+
+  // 3. Ensure graph header
+  if (!/^(graph|flowchart|sequenceDiagram|classDiagram|gantt|erDiagram)/i.test(text.trim())) {
+    text = "graph TD\n" + text;
+  }
+
+  // 4. Fix unquoted subgraph titles with spaces: subgraph Master Node => subgraph Master_Node["Master Node"]
+  text = text.replace(/subgraph\s+([A-Za-z0-9_ ]+?)(?=\n|\[|$)/gi, (match, name) => {
+    if (name.includes("[") || name.startsWith('"')) return match;
+    const trimmed = name.trim();
+    if (trimmed.includes(" ")) {
+      const safeId = trimmed.replace(/\s+/g, '_');
+      return `subgraph ${safeId}["${trimmed}"]`;
+    }
+    return `subgraph ${trimmed}`;
+  });
+
+  // 5. Wrap unquoted node labels containing spaces or special characters in quotes
+  text = text.replace(/(\w+)\s*\[([^"\n\]]+)\]/g, (m, id, label) => {
+    if (label.startsWith('"') && label.endsWith('"')) return m;
+    return `${id}["${label}"]`;
+  });
+
+  return text;
+}
+
 function MermaidDiagram({ code }) {
+  const [mounted, setMounted] = useState(false);
+  const [svgHtml, setSvgHtml] = useState(null);
+  const [loading, setLoading] = useState(true);
+  const [error, setError] = useState(false);
+  const [showCode, setShowCode] = useState(false);
   const containerRef = useRef(null);
 
+  // Generate unique diagram ID per instance to avoid DOM collisions
+  const uniqueIdRef = useRef(`mermaid-${Math.random().toString(36).substring(2, 9)}`);
+
   useEffect(() => {
-    if (containerRef.current && code) {
-      let nodeIdx = 0;
-      const labelToId = new Map();
-      let cleanedCode = code
-        .replace(/-->\|([^|]+)\|>/g, "-->|$1|")
-        .replace(/->\|([^|]+)\|>/g, "-->|$1|")
-        .replace(/-->\|([^|]+)\| >/g, "-->|$1|")
-        .replace(/<-->\|([^|]+)\|/g, "-->|$1|")
-        .replace(/style\s+\w+\s+fill:[^;\n]+;\s*/gi, "")
-        .replace(/style\s+\w+\s+fill:[^;\n]+$/gi, "");
+    setMounted(true);
+  }, []);
 
-      // Fix unquoted subgraphs with spaces: subgraph Azure Region => subgraph Azure_Region
-      cleanedCode = cleanedCode.replace(/subgraph\s+([A-Za-z0-9_ ]+?)(?=\n|\[|$)/g, (match, name) => {
-        if (name.includes("[") || name.startsWith('"')) return match;
-        const safeName = name.trim().replace(/\s+/g, '_');
-        return `subgraph ${safeName}`;
-      });
+  useEffect(() => {
+    if (!mounted || !code) return;
 
-      // Ensure graph header
-      if (!/^(graph|flowchart|sequenceDiagram|classDiagram|gantt|erDiagram)/i.test(cleanedCode.trim())) {
-        cleanedCode = "graph LR\n" + cleanedCode;
+    let isSubscribed = true;
+    setLoading(true);
+    setError(false);
+
+    const formattedCode = formatAndSanitizeMermaidCode(code);
+    const diagramId = uniqueIdRef.current;
+
+    const renderDiagram = async () => {
+      try {
+        const { svg } = await mermaid.render(diagramId, formattedCode);
+        if (isSubscribed) {
+          setSvgHtml(injectSVGStyles(svg));
+          setLoading(false);
+        }
+      } catch (primaryErr) {
+        console.warn("Primary Mermaid render failed, trying simplified fallback...", primaryErr);
+        try {
+          const fallbackCode = formattedCode.replace(/\|([^|]+)\|/g, '');
+          const { svg } = await mermaid.render(`${diagramId}-fb`, fallbackCode);
+          if (isSubscribed) {
+            setSvgHtml(injectSVGStyles(svg));
+            setLoading(false);
+          }
+        } catch (fallbackErr) {
+          console.error("Mermaid diagram render error:", fallbackErr);
+          if (isSubscribed) {
+            setError(true);
+            setLoading(false);
+          }
+        }
+      } finally {
+        document.querySelectorAll("[id^='dmermaid']").forEach((el) => el.remove());
       }
+    };
 
-      // Auto-assign IDs for standalone quoted nodes: "Label" --> ... => N1["Label"] --> ...
-      cleanedCode = cleanedCode.replace(/(?<=^|\s|-->|->)("[^"\n]+")(?=\s|-->|->|$)/gm, (match) => {
-        const text = match.trim();
-        if (!labelToId.has(text)) {
-          nodeIdx++;
-          labelToId.set(text, `N${nodeIdx}[${text}]`);
-        }
-        return labelToId.get(text);
-      });
+    renderDiagram();
 
-      // Wrap unquoted labels containing brackets/parens/slashes in quotes: ID[Label (parens)] => ID["Label (parens)"]
-      cleanedCode = cleanedCode.replace(/(\w+)\s*\[([^"\n\]]+)\]/g, (m, id, label) => {
-        if (label.startsWith('"') && label.endsWith('"')) return m;
-        return `${id}["${label}"]`;
-      });
+    return () => {
+      isSubscribed = false;
+    };
+  }, [mounted, code]);
 
-      const id = `mermaid-${Math.random().toString(36).substring(2, 9)}`;
+  if (!mounted) {
+    return <div className="my-4 h-32 bg-[#030712] border border-indigo-500/20 rounded-2xl animate-pulse flex items-center justify-center text-xs text-slate-500">Initializing Diagram Engine...</div>;
+  }
 
-      const cleanupGlobalErrorPopup = () => {
-        const errElem = document.getElementById(`d${id}`) || document.getElementById(`d${id}-fb`);
-        if (errElem) errElem.remove();
-        document.querySelectorAll("[id^='dmermaid']").forEach(el => el.remove());
-      };
+  if (loading) {
+    return (
+      <div className="my-4 p-6 bg-[#030712] border border-indigo-500/20 rounded-2xl flex flex-col items-center justify-center gap-3 shadow-xl">
+        <Activity className="animate-spin text-indigo-400 w-5 h-5" />
+        <span className="text-xs font-medium text-slate-400">Rendering Architecture Topology...</span>
+      </div>
+    );
+  }
 
-      mermaid.render(id, cleanedCode).then(({ svg }) => {
-        cleanupGlobalErrorPopup();
-        if (containerRef.current) {
-          containerRef.current.innerHTML = injectSVGStyles(svg);
-        }
-      }).catch((err) => {
-        cleanupGlobalErrorPopup();
-        // Fallback retry with simplified text labels if initial render fails
-        const fallbackCode = cleanedCode.replace(/\|([^|]+)\|/g, '');
-        mermaid.render(`${id}-fb`, fallbackCode).then(({ svg }) => {
-          cleanupGlobalErrorPopup();
-          if (containerRef.current) {
-            containerRef.current.innerHTML = injectSVGStyles(svg);
-          }
-        }).catch(() => {
-          cleanupGlobalErrorPopup();
-          if (containerRef.current) {
-            containerRef.current.innerHTML = `<div class="p-3 text-xs font-mono bg-slate-900/90 text-slate-300 rounded-lg border border-slate-700/50 overflow-x-auto"><div class="text-amber-400 font-semibold mb-1">Diagram Code</div>${cleanedCode}</div>`;
-          }
-        });
-      });
-    }
-  }, [code]);
+  if (error) {
+    return (
+      <div className="my-4 p-4 bg-slate-950/90 border border-amber-500/30 rounded-2xl shadow-lg">
+        <div className="flex items-center justify-between">
+          <div className="flex items-center gap-2 text-amber-400 text-xs font-semibold">
+            <AlertTriangle size={15} />
+            <span>Architecture Diagram Topology</span>
+          </div>
+          <button
+            onClick={() => setShowCode(!showCode)}
+            className="flex items-center gap-1 text-[11px] text-slate-400 hover:text-white px-2.5 py-1 rounded-md bg-white/5 border border-white/10 transition-colors cursor-pointer"
+          >
+            {showCode ? <ChevronDown size={13} /> : <ChevronRight size={13} />}
+            <span>{showCode ? "Hide Diagram Code" : "View Diagram Code"}</span>
+          </button>
+        </div>
 
-  return <div ref={containerRef} className="mermaid-svg-container my-4 p-5 bg-[#030712] border border-indigo-500/20 rounded-2xl overflow-x-auto w-full block shadow-xl shadow-black/50" />;
+        {showCode && (
+          <div className="mt-3 p-3 bg-black/60 rounded-xl border border-white/10 font-mono text-xs text-slate-300 overflow-x-auto">
+            <pre className="text-indigo-300 leading-relaxed">{formatAndSanitizeMermaidCode(code)}</pre>
+          </div>
+        )}
+      </div>
+    );
+  }
+
+  return (
+    <div className="my-4 group relative bg-[#030712] border border-indigo-500/20 rounded-2xl shadow-xl shadow-black/50 overflow-hidden">
+      <div
+        ref={containerRef}
+        className="mermaid-svg-container p-5 overflow-x-auto w-full block"
+        dangerouslySetInnerHTML={{ __html: svgHtml }}
+      />
+      <div className="px-4 py-2 bg-slate-950/80 border-t border-white/5 flex items-center justify-between text-[11px] text-slate-500">
+        <span className="flex items-center gap-1.5 text-indigo-400 font-medium">
+          <Zap size={12} /> Interactive Architecture Topology
+        </span>
+        <button
+          onClick={() => setShowCode(!showCode)}
+          className="flex items-center gap-1 text-slate-400 hover:text-white transition-colors cursor-pointer"
+        >
+          {showCode ? <ChevronDown size={12} /> : <ChevronRight size={12} />}
+          <span>{showCode ? "Hide Diagram Code" : "View Diagram Code"}</span>
+        </button>
+      </div>
+      {showCode && (
+        <div className="p-3 bg-black/80 border-t border-white/10 font-mono text-xs text-indigo-300 overflow-x-auto">
+          <pre>{formatAndSanitizeMermaidCode(code)}</pre>
+        </div>
+      )}
+    </div>
+  );
 }
 
 function preprocessMarkdownContent(content) {
