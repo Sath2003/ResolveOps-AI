@@ -20,6 +20,49 @@ mermaid.initialize({
   }
 });
 
+function injectSVGStyles(rawSvg) {
+  if (!rawSvg) return "";
+
+  const customStyle = `<style>
+    svg { max-width: 100% !important; height: auto !important; display: block !important; margin: 0 auto !important; background: transparent !important; }
+    foreignObject, foreignObject *, .nodeLabel, .cluster-label, text, tspan, span, div {
+      fill: #ffffff !important;
+      color: #ffffff !important;
+      font-family: ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif !important;
+      font-size: 13px !important;
+      font-weight: 600 !important;
+      opacity: 1 !important;
+      visibility: visible !important;
+    }
+    .node rect, .node circle, .node polygon, .node path {
+      fill: #1e1b4b !important;
+      stroke: #6366f1 !important;
+      stroke-width: 2px !important;
+    }
+    .cluster rect {
+      fill: #0f172a !important;
+      stroke: #334155 !important;
+      stroke-width: 1.5px !important;
+    }
+    .edgePath path, .flowchart-link {
+      stroke: #818cf8 !important;
+      stroke-width: 2px !important;
+    }
+    .edgeLabel rect {
+      fill: #090d16 !important;
+      stroke: #374151 !important;
+    }
+    .edgeLabel text, .edgeLabel span {
+      fill: #a5b4fc !important;
+      color: #a5b4fc !important;
+      font-size: 11px !important;
+      font-weight: 500 !important;
+    }
+  </style>`;
+
+  return rawSvg.replace(/<svg[^>]*>/, (match) => `${match}${customStyle}`);
+}
+
 function MermaidDiagram({ code }) {
   const containerRef = useRef(null);
 
@@ -34,6 +77,13 @@ function MermaidDiagram({ code }) {
         .replace(/<-->\|([^|]+)\|/g, "-->|$1|")
         .replace(/style\s+\w+\s+fill:[^;\n]+;\s*/gi, "")
         .replace(/style\s+\w+\s+fill:[^;\n]+$/gi, "");
+
+      // Fix unquoted subgraphs with spaces: subgraph Azure Region => subgraph Azure_Region
+      cleanedCode = cleanedCode.replace(/subgraph\s+([A-Za-z0-9_ ]+?)(?=\n|\[|$)/g, (match, name) => {
+        if (name.includes("[") || name.startsWith('"')) return match;
+        const safeName = name.trim().replace(/\s+/g, '_');
+        return `subgraph ${safeName}`;
+      });
 
       // Ensure graph header
       if (!/^(graph|flowchart|sequenceDiagram|classDiagram|gantt|erDiagram)/i.test(cleanedCode.trim())) {
@@ -67,7 +117,7 @@ function MermaidDiagram({ code }) {
       mermaid.render(id, cleanedCode).then(({ svg }) => {
         cleanupGlobalErrorPopup();
         if (containerRef.current) {
-          containerRef.current.innerHTML = svg;
+          containerRef.current.innerHTML = injectSVGStyles(svg);
         }
       }).catch((err) => {
         cleanupGlobalErrorPopup();
@@ -76,7 +126,7 @@ function MermaidDiagram({ code }) {
         mermaid.render(`${id}-fb`, fallbackCode).then(({ svg }) => {
           cleanupGlobalErrorPopup();
           if (containerRef.current) {
-            containerRef.current.innerHTML = svg;
+            containerRef.current.innerHTML = injectSVGStyles(svg);
           }
         }).catch(() => {
           cleanupGlobalErrorPopup();
