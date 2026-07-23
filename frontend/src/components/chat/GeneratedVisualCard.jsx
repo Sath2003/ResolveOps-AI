@@ -273,8 +273,9 @@ export function VisualErrorState({ errorCode, title, onRetry, onViewExplanation,
   };
 
   const message =
-    messages[errorCode] ||
-    "The architecture visual could not be generated. The written explanation is still available.";
+    (errorCode && errorCode.includes(":")) 
+      ? errorCode
+      : (messages[errorCode] || errorCode || "The architecture visual could not be generated. The written explanation is still available.");
 
   return (
     <div className="my-4 p-4 bg-amber-500/5 border border-amber-500/25 rounded-2xl">
@@ -284,7 +285,7 @@ export function VisualErrorState({ errorCode, title, onRetry, onViewExplanation,
           <p className="text-sm font-semibold text-amber-300 mb-0.5">
             {title || "Visual Generation Failed"}
           </p>
-          <p className="text-xs text-amber-300/70 leading-relaxed">{message}</p>
+          <p className="text-xs text-amber-300/70 leading-relaxed font-mono break-all">{message}</p>
         </div>
       </div>
       <div className="flex items-center gap-2 flex-wrap">

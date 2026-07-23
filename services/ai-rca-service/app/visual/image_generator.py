@@ -84,14 +84,44 @@ async def generate_and_store_image(
         created_at=time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
     )
 
+    logger.info(
+        "visual_generation_stage",
+        extra={
+            "request_id": request_id,
+            "visual_id": visual_id,
+            "stage": "visual_generation_init",
+            "status": "started",
+            "model": model,
+            "quality": quality,
+            "size": size,
+        },
+    )
+
     if not settings.VISUAL_GENERATION_ENABLED:
-        logger.info("Visual generation disabled; returning FAILED metadata", extra={"request_id": request_id})
+        logger.info(
+            "visual_generation_stage",
+            extra={
+                "request_id": request_id,
+                "visual_id": visual_id,
+                "stage": "visual_generation_disabled",
+                "status": "failed",
+            },
+        )
         meta.status = VisualStatus.FAILED
         meta.error_code = "visual_generation_disabled"
         return meta
 
     if not settings.OPENAI_API_KEY:
-        logger.error("OPENAI_API_KEY not set; cannot generate image", extra={"request_id": request_id})
+        logger.error(
+            "visual_generation_stage",
+            extra={
+                "request_id": request_id,
+                "visual_id": visual_id,
+                "stage": "check_api_key",
+                "status": "failed",
+                "error": "OPENAI_API_KEY not set",
+            },
+        )
         meta.status = VisualStatus.FAILED
         meta.error_code = "missing_api_key"
         return meta
@@ -102,7 +132,18 @@ async def generate_and_store_image(
         import asyncio
         client = _get_openai_client()
 
-        # DALL-E 3 requires b64_json response_format for reliable retrieval
+        logger.info(
+            "visual_generation_stage",
+            extra={
+                "request_id": request_id,
+                "visual_id": visual_id,
+                "stage": "image_provider_request",
+                "status": "started",
+                "model": model,
+                "prompt_length": len(image_prompt),
+            },
+        )
+
         response = await asyncio.wait_for(
             asyncio.to_thread(
                 _call_dalle,
@@ -111,39 +152,74 @@ async def generate_and_store_image(
                 model=model,
                 quality=quality,
                 size=size,
+                request_id=request_id,
+                visual_id=visual_id,
             ),
             timeout=settings.VISUAL_GENERATION_TIMEOUT_SECONDS,
         )
 
         if response is None:
-            raise ValueError("Empty response from image API")
+            raise ValueError("Empty response or null data returned from OpenAI Image API")
+
+        logger.info(
+            "visual_generation_stage",
+            extra={
+                "request_id": request_id,
+                "visual_id": visual_id,
+                "stage": "image_provider_response",
+                "status": "success",
+                "bytes_received": len(response),
+            },
+        )
 
         # Decode and save to disk
         filename = f"{visual_id}.png"
         file_path = os.path.join(_VISUALS_DIR, filename)
+
+        logger.info(
+            "visual_generation_stage",
+            extra={
+                "request_id": request_id,
+                "visual_id": visual_id,
+                "stage": "image_storage_save",
+                "status": "started",
+                "target_path": file_path,
+            },
+        )
+
         with open(file_path, "wb") as f:
             f.write(response)
 
         elapsed = round(time.monotonic() - start_time, 2)
         logger.info(
-            "Image generated and saved",
+            "visual_generation_stage",
             extra={
                 "request_id": request_id,
                 "visual_id": visual_id,
+                "stage": "image_storage_save",
+                "status": "success",
                 "duration_seconds": elapsed,
                 "size_bytes": len(response),
-            }
+                "file_path": file_path,
+            },
         )
 
         meta.status = VisualStatus.READY
-        meta.storage_path = file_path  # internal only, never returned to client
+        meta.storage_path = file_path
         meta.url_path = f"/api/visuals/{visual_id}"
         return meta
 
     except asyncio.TimeoutError:
         logger.error(
-            "Image generation timed out",
-            extra={"request_id": request_id, "timeout": settings.VISUAL_GENERATION_TIMEOUT_SECONDS}
+            "visual_generation_stage",
+            extra={
+                "request_id": request_id,
+                "visual_id": visual_id,
+                "stage": "image_provider_request",
+                "status": "failed",
+                "error_code": "generation_timeout",
+                "timeout_seconds": settings.VISUAL_GENERATION_TIMEOUT_SECONDS,
+            },
         )
         meta.status = VisualStatus.FAILED
         meta.error_code = "generation_timeout"
@@ -151,19 +227,45 @@ async def generate_and_store_image(
 
     except Exception as exc:
         error_type = type(exc).__name__
-        # Classify common OpenAI errors safely (never log raw message which might contain prompt)
+        error_msg = str(exc)
         error_code = _classify_openai_error(exc)
         logger.error(
-            "Image generation failed",
-            extra={"request_id": request_id, "error_type": error_type, "error_code": error_code}
+            "visual_generation_stage",
+            extra={
+                "request_id": request_id,
+                "visual_id": visual_id,
+                "stage": "image_provider_request",
+                "status": "failed",
+                "error_type": error_type,
+                "error_message": error_msg,
+                "error_code": error_code,
+            },
         )
         meta.status = VisualStatus.FAILED
-        meta.error_code = error_code
+        meta.error_code = f"{error_code}: {error_type} - {error_msg}"
         return meta
 
 
-def _call_dalle(client, prompt: str, model: str, quality: str, size: str) -> Optional[bytes]:
+def _call_dalle(
+    client,
+    prompt: str,
+    model: str,
+    quality: str,
+    size: str,
+    request_id: str = "",
+    visual_id: str = "",
+) -> Optional[bytes]:
     """Synchronous DALL-E call (run in thread). Returns raw PNG bytes or None."""
+    logger.info(
+        "visual_generation_stage",
+        extra={
+            "request_id": request_id,
+            "visual_id": visual_id,
+            "stage": "dalle_sdk_invoke",
+            "status": "executing",
+            "model": model,
+        },
+    )
     response = client.images.generate(
         model=model,
         prompt=prompt,

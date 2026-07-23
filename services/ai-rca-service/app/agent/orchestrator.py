@@ -266,13 +266,40 @@ class InvestigationOrchestrator:
             )
 
         # ── Step 1: Classify intent ────────────────────────────────────────────
+        logger.info(
+            "visual_generation_stage",
+            extra={
+                "request_id": request_id,
+                "visual_id": visual_id,
+                "stage": "intent_classification",
+                "status": "started",
+            },
+        )
         try:
             intent = classify_intent(message=message, invoke_fn=_invoke)
         except Exception as exc:
-            logger.warning(f"Intent classification failed: {exc}; defaulting to TEXT")
+            logger.warning(
+                "visual_generation_stage",
+                extra={
+                    "request_id": request_id,
+                    "visual_id": visual_id,
+                    "stage": "intent_classification",
+                    "status": "fallback",
+                    "error": str(exc),
+                },
+            )
             intent = ResponseIntent.TEXT
 
-        logger.info("Intent classified", extra={"intent": intent, "request_id": request_id})
+        logger.info(
+            "visual_generation_stage",
+            extra={
+                "request_id": request_id,
+                "visual_id": visual_id,
+                "stage": "intent_classification",
+                "status": "completed",
+                "intent": intent.value,
+            },
+        )
 
         # ── Step 2: Non-visual intents → plain LLM response ──────────────────
         non_visual_intents = {
@@ -283,7 +310,6 @@ class InvestigationOrchestrator:
         }
 
         if intent == ResponseIntent.MERMAID_DIAGRAM:
-            # User explicitly asked for Mermaid — pass through to LLM with Mermaid instructions
             mermaid_system = (
                 "You are a technical diagram assistant. "
                 "Return a Mermaid diagram in a ```mermaid code block. "
@@ -332,6 +358,15 @@ class InvestigationOrchestrator:
             }
 
         # ── Step 3: Visual intents — plan visual spec ─────────────────────────
+        logger.info(
+            "visual_generation_stage",
+            extra={
+                "request_id": request_id,
+                "visual_id": visual_id,
+                "stage": "visual_planning",
+                "status": "started",
+            },
+        )
         prev_spec_obj: Optional[VisualSpec] = None
         if previous_visual_spec:
             try:
@@ -350,12 +385,29 @@ class InvestigationOrchestrator:
                 prev_spec_obj,
             )
         except Exception as exc:
-            logger.error("Visual planning raised exception", extra={"error": type(exc).__name__})
+            logger.error(
+                "visual_generation_stage",
+                extra={
+                    "request_id": request_id,
+                    "visual_id": visual_id,
+                    "stage": "visual_planning",
+                    "status": "failed",
+                    "error": str(exc),
+                },
+            )
             spec, plan_errors = None, [str(exc)]
 
         if spec is None:
-            # Planning failed — fall back to written explanation
-            logger.warning("Visual planning failed; returning text fallback", extra={"errors": plan_errors})
+            logger.warning(
+                "visual_generation_stage",
+                extra={
+                    "request_id": request_id,
+                    "visual_id": visual_id,
+                    "stage": "visual_spec_validation",
+                    "status": "failed",
+                    "errors": plan_errors,
+                },
+            )
             try:
                 fallback_answer = await asyncio.to_thread(
                     _invoke,
@@ -379,11 +431,22 @@ class InvestigationOrchestrator:
                 "visual_generation_error": "planning_failed",
             }
 
+        logger.info(
+            "visual_generation_stage",
+            extra={
+                "request_id": request_id,
+                "visual_id": visual_id,
+                "stage": "visual_spec_validation",
+                "status": "success",
+                "render_engine": spec.render_engine.value,
+                "components": len(spec.all_components()),
+            },
+        )
+
         render_engine = spec.render_engine
 
-        # ── Step 4A: Structured diagram (Excalidraw) ──────────────────────────
+        # ── Step 4A: Structured diagram ───────────────────────────────────────
         if render_engine == RenderEngine.STRUCTURED:
-            # Build a lightweight node/edge JSON that the frontend Excalidraw component renders
             structured_payload = self._spec_to_structured_diagram(spec)
             explanation = await self._generate_explanation(spec, message, _invoke)
 
@@ -412,7 +475,26 @@ class InvestigationOrchestrator:
             from app.visual.prompt_builder import build_image_prompt
             from app.visual.image_generator import generate_and_store_image
 
+            logger.info(
+                "visual_generation_stage",
+                extra={
+                    "request_id": request_id,
+                    "visual_id": visual_id,
+                    "stage": "image_prompt_building",
+                    "status": "started",
+                },
+            )
             image_prompt = build_image_prompt(spec)
+            logger.info(
+                "visual_generation_stage",
+                extra={
+                    "request_id": request_id,
+                    "visual_id": visual_id,
+                    "stage": "image_prompt_building",
+                    "status": "completed",
+                    "prompt_length": len(image_prompt),
+                },
+            )
 
             meta = await generate_and_store_image(
                 image_prompt=image_prompt,
@@ -427,6 +509,16 @@ class InvestigationOrchestrator:
             explanation = await self._generate_explanation(spec, message, _invoke)
 
             if meta.status.value == "ready":
+                logger.info(
+                    "visual_generation_stage",
+                    extra={
+                        "request_id": request_id,
+                        "visual_id": visual_id,
+                        "stage": "api_gateway_response",
+                        "status": "success",
+                        "url": meta.url_path,
+                    },
+                )
                 visual_payload = {
                     "kind": "generated_image",
                     "visual_id": visual_id,
@@ -454,7 +546,16 @@ class InvestigationOrchestrator:
                     "answer": _json.dumps(response_body),
                 }
             else:
-                # Image generation failed — return explanation with error
+                logger.error(
+                    "visual_generation_stage",
+                    extra={
+                        "request_id": request_id,
+                        "visual_id": visual_id,
+                        "stage": "api_gateway_response",
+                        "status": "failed",
+                        "error_code": meta.error_code,
+                    },
+                )
                 error_body = {
                     "type": "visual_response",
                     "title": spec.title,
@@ -464,7 +565,7 @@ class InvestigationOrchestrator:
                     "visual": None,
                     "visual_error": {
                         "error_code": meta.error_code,
-                        "message": "The architecture visual could not be generated. The written explanation is still available.",
+                        "message": f"Visual generation failed: {meta.error_code}",
                     }
                 }
                 return {

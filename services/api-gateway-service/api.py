@@ -478,7 +478,10 @@ async def serve_visual(visual_id: str, current_user: dict = Depends(get_current_
         raise HTTPException(status_code=400, detail="Invalid visual ID.")
 
     if not os.path.isfile(file_path):
+        print(f"[VISUAL_STAGE] visual_id={visual_id} stage=frontend_image_retrieval status=failed error=file_not_found path={file_path}")
         raise HTTPException(status_code=404, detail="Visual not found.")
+
+    print(f"[VISUAL_STAGE] visual_id={visual_id} stage=frontend_image_retrieval status=serving path={file_path}")
 
     return FileResponse(
         path=file_path,
