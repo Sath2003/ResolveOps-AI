@@ -9,7 +9,7 @@ mermaid.initialize({
   startOnLoad: false,
   suppressErrorRendering: true,
   securityLevel: "loose",
-  theme: "base",
+  theme: "dark",
   flowchart: {
     useMaxWidth: false,
     htmlLabels: true,
@@ -18,7 +18,7 @@ mermaid.initialize({
   themeVariables: {
     darkMode: true,
     background: "transparent",
-    primaryColor: "#4f46e5",
+    primaryColor: "#1e1b4b",
     primaryTextColor: "#ffffff",
     primaryBorderColor: "#6366f1",
     lineColor: "#818cf8",
@@ -50,50 +50,14 @@ function injectSVGStyles(rawSvg) {
   });
 
   const customStyle = `<style>
-    .mermaid-svg-container svg { max-width: 100% !important; width: 100% !important; height: auto !important; min-height: 260px !important; display: block !important; margin: 0 auto !important; background: transparent !important; }
-    
-    .mermaid-svg-container g.cluster > rect, .mermaid-svg-container .cluster > rect, .mermaid-svg-container g.cluster rect {
-      fill: #0f172a !important;
-      stroke: #334155 !important;
-      stroke-width: 1.5px !important;
-    }
-
-    .mermaid-svg-container g.cluster > rect.inner, .mermaid-svg-container .cluster rect.inner, .mermaid-svg-container rect.inner, .mermaid-svg-container g.cluster .inner {
-      fill: transparent !important;
-      stroke: none !important;
-    }
-
-    .mermaid-svg-container g.node rect, .mermaid-svg-container g.node circle, .mermaid-svg-container g.node polygon, .mermaid-svg-container g.node path, .mermaid-svg-container .node rect, .mermaid-svg-container .node circle, .mermaid-svg-container .node polygon, .mermaid-svg-container .node path {
-      fill: #1e1b4b !important;
-      stroke: #6366f1 !important;
-      stroke-width: 2px !important;
-    }
-
-    .mermaid-svg-container foreignObject, .mermaid-svg-container foreignObject *, .mermaid-svg-container .nodeLabel, .mermaid-svg-container .cluster-label, .mermaid-svg-container text, .mermaid-svg-container tspan, .mermaid-svg-container span, .mermaid-svg-container p {
-      fill: #ffffff !important;
-      color: #ffffff !important;
-      font-family: ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif !important;
-      font-size: 13px !important;
-      font-weight: 600 !important;
-      opacity: 1 !important;
-      visibility: visible !important;
-    }
-
-    .mermaid-svg-container .edgePath path, .mermaid-svg-container .flowchart-link {
-      stroke: #818cf8 !important;
-      stroke-width: 2px !important;
-    }
-
-    .mermaid-svg-container .edgeLabel rect {
-      fill: #090d16 !important;
-      stroke: #374151 !important;
-    }
-
-    .mermaid-svg-container .edgeLabel text, .mermaid-svg-container .edgeLabel span, .mermaid-svg-container .edgeLabel div {
-      fill: #a5b4fc !important;
-      color: #a5b4fc !important;
-      font-size: 11px !important;
-      font-weight: 500 !important;
+    .mermaid-svg-container svg {
+      max-width: 100% !important;
+      width: 100% !important;
+      height: auto !important;
+      min-height: 250px !important;
+      display: block !important;
+      margin: 0 auto !important;
+      background: transparent !important;
     }
   </style>`;
 
