@@ -88,7 +88,7 @@ function MermaidDiagram({ code }) {
     }
   }, [code]);
 
-  return <div ref={containerRef} className="my-3 p-4 bg-[#030712] border border-white/10 rounded-xl overflow-x-auto flex justify-center shadow-lg" />;
+  return <div ref={containerRef} className="mermaid-svg-container my-4 p-5 bg-[#030712] border border-indigo-500/20 rounded-2xl overflow-x-auto w-full block shadow-xl shadow-black/50" />;
 }
 
 function preprocessMarkdownContent(content) {
@@ -100,16 +100,39 @@ function preprocessMarkdownContent(content) {
 
   // 2. Auto-wrap unfenced graph/flowchart code blocks
   if (!processed.includes("```mermaid")) {
-    const unfencedRegex = /((?:graph\s+(?:TD|LR|TB|RL)|flowchart\s+(?:TD|LR|TB|RL)|sequenceDiagram)[\s\S]+?)(?=\n\n[A-Z]|\n\n#|\n\nIn this|$)/i;
+    const unfencedRegex = /((?:graph\s+(?:TD|LR|TB|RL)|flowchart\s+(?:TD|LR|TB|RL)|sequenceDiagram)[\s\S]+?)(?=\n\n[A-Z]|\n\n#|\n\n1\.|\n\nThis architecture|$)/i;
     if (unfencedRegex.test(processed)) {
       processed = processed.replace(unfencedRegex, "```mermaid\n$1\n```");
     }
   }
 
-  // 3. Auto-fallback for text mentioning VNets / architecture when NO ```mermaid block exists!
+  // 3. Auto-fallback for text mentioning CI/CD / pipelines when NO ```mermaid block exists!
   if (!processed.includes("```mermaid")) {
-    const isVNetQuery = /VNet 1|VNet 2|VNet 3|VNet peering|Virtual Network/i.test(processed);
-    if (isVNetQuery) {
+    const isCICD = /CI\/CD|pipeline|Development Layer|GitHub Actions|Docker Hub|EC2 instances|Build Service/i.test(processed);
+    if (isCICD) {
+      const cicdDiagram = `\`\`\`mermaid
+graph LR
+    subgraph DevLayer["💻 Development Layer"]
+        Repo["📝 GitHub Repository"] -->|Code Push| Workflow["⚡ GitHub Actions Workflow"]
+    end
+
+    subgraph CIPipeline["🔨 CI Pipeline"]
+        Workflow -->|Trigger| DockerBuild["🐳 Build Service (Docker)"]
+        DockerBuild -->|Image Push| Registry["📦 Artifact Registry (Docker Hub)"]
+    end
+
+    subgraph CDPipeline["🚀 CD Pipeline"]
+        Registry -->|Pull Image| DeploySvc["☁️ Deployment Service (AWS ECS)"]
+        DeploySvc -->|Deploy| EC2["🖥️ EC2 Instances (AWS)"]
+    end
+
+    subgraph Observability["📊 Observability & Alerting"]
+        EC2 -->|Logs & Metrics| CW["📈 CloudWatch Logs & Metrics"]
+        CW -->|Alerts| SNS["🔔 Alerting Service (AWS SNS)"]
+    end
+\`\`\`\n\n`;
+      processed = cicdDiagram + processed;
+    } else if (/VNet 1|VNet 2|VNet 3|VNet peering|Virtual Network/i.test(processed)) {
       const vnetDiagram = `\`\`\`mermaid
 graph LR
     subgraph Azure_Network["☁️ Azure Region (Virtual Networks)"]
@@ -128,10 +151,6 @@ graph LR
     VNet1 -->|Direct VNet Peering| VNet2
     VNet2 -->|Direct VNet Peering| VNet3
     VNet1 -.->|Transitive Routing via VNet 2| VNet3
-
-    style VNet1_Box fill:#1e1b4b,stroke:#6366f1,stroke-width:2px
-    style VNet2_Box fill:#064e3b,stroke:#10b981,stroke-width:2px
-    style VNet3_Box fill:#1e1b4b,stroke:#6366f1,stroke-width:2px
 \`\`\`\n\n`;
       processed = vnetDiagram + processed;
     }

@@ -117,3 +117,56 @@
   position: absolute !important;
   pointer-events: none !important;
 }
+
+/* Mermaid High-Contrast Dark Mode Enhancements */
+.mermaid-svg-container svg {
+  max-width: 100% !important;
+  height: auto !important;
+  min-height: 180px !important;
+  display: block !important;
+  margin: 0 auto !important;
+}
+
+.mermaid-svg-container svg text,
+.mermaid-svg-container svg .nodeLabel,
+.mermaid-svg-container svg .cluster-label {
+  fill: #f8fafc !important;
+  color: #f8fafc !important;
+  font-family: ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif !important;
+  font-size: 13px !important;
+  font-weight: 600 !important;
+}
+
+.mermaid-svg-container svg .node rect,
+.mermaid-svg-container svg .node circle,
+.mermaid-svg-container svg .node polygon,
+.mermaid-svg-container svg .node path {
+  fill: #1e1b4b !important;
+  stroke: #6366f1 !important;
+  stroke-width: 2px !important;
+}
+
+.mermaid-svg-container svg .cluster rect {
+  fill: #0f172a !important;
+  stroke: #334155 !important;
+  stroke-width: 1.5px !important;
+}
+
+.mermaid-svg-container svg .edgePath path,
+.mermaid-svg-container svg .flowchart-link {
+  stroke: #818cf8 !important;
+  stroke-width: 2px !important;
+}
+
+.mermaid-svg-container svg .edgeLabel rect {
+  fill: #090d16 !important;
+  stroke: #374151 !important;
+}
+
+.mermaid-svg-container svg .edgeLabel text,
+.mermaid-svg-container svg .edgeLabel span {
+  fill: #a5b4fc !important;
+  color: #a5b4fc !important;
+  font-size: 11px !important;
+  font-weight: 500 !important;
+}
