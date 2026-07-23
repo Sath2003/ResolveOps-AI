@@ -282,20 +282,35 @@ def _call_dalle(
         "n": 1,
     }
 
-    if is_gpt_image:
+    # Strict check: DALL-E 2 supports b64_json; DALL-E 3 & GPT Image models do NOT support response_format in new API
+    if "dall-e-2" in model.lower():
+        params["response_format"] = "b64_json"
+        if quality in ["standard", "hd"]:
+            params["quality"] = quality
+    elif is_gpt_image:
         params["output_format"] = settings.OPENAI_IMAGE_FORMAT
         if quality in ["low", "medium", "high"]:
             params["quality"] = quality
     else:
-        # For legacy models, only include response_format if not explicitly model-restricted
-        if "dall-e" in model.lower():
-            params["response_format"] = "b64_json"
+        # DALL-E 3 default params
         if quality in ["standard", "hd"]:
             params["quality"] = quality
 
-    # GUARANTEE: Never send response_format if model is not dall-e
-    if "dall-e" not in model.lower():
+    # ABSOLUTE SAFETY PURGE: Never send response_format for dall-e-3 or gpt-image
+    if "dall-e-2" not in model.lower():
         params.pop("response_format", None)
+
+    logger.info(
+        "visual_generation_stage",
+        extra={
+            "request_id": request_id,
+            "visual_id": visual_id,
+            "stage": "dalle_sdk_invoke_params",
+            "status": "executing",
+            "model": model,
+            "param_keys": list(params.keys()),
+        },
+    )
 
     try:
         response = client.images.generate(**params)
