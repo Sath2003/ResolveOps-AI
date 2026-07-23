@@ -139,6 +139,7 @@ async def chat(req: ChatRequest):
         message=req.message,
         session_id=req.session_id,
         tenant_id=req.tenant_id,
+        previous_visual_spec=req.previous_visual_spec,
     )
     return result
 

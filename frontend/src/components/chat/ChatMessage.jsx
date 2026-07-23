@@ -1,19 +1,25 @@
 "use client";
 
 import { useState, useEffect, useRef } from "react";
-import { User, Bot, AlertTriangle, RefreshCw, Copy, CheckCircle2, XCircle, ChevronDown, ChevronRight, Shield, Zap, Clock, Info, Activity } from "lucide-react";
+import {
+  User, Bot, AlertTriangle, RefreshCw, Copy, CheckCircle2,
+  XCircle, ChevronDown, ChevronRight, Shield, Zap, Clock, Info, Activity,
+} from "lucide-react";
 import ReactMarkdown from "react-markdown";
 import mermaid from "mermaid";
+import { GeneratedVisualCard, VisualErrorState } from "./GeneratedVisualCard";
+import { StructuredDiagramCard } from "./StructuredDiagramCard";
 
+// ── Mermaid initialization (strict security mode) ─────────────────────────────
 mermaid.initialize({
   startOnLoad: false,
   suppressErrorRendering: true,
-  securityLevel: "loose",
+  securityLevel: "strict",
   theme: "dark",
   flowchart: {
     useMaxWidth: false,
     htmlLabels: false,
-    curve: "basis"
+    curve: "basis",
   },
   themeVariables: {
     darkMode: true,
@@ -25,24 +31,25 @@ mermaid.initialize({
     secondaryColor: "#0f172a",
     tertiaryColor: "#1e293b",
     nodeTextColor: "#ffffff",
-    textColor: "#ffffff"
-  }
+    textColor: "#ffffff",
+  },
 });
 
+// ── SVG style injection ───────────────────────────────────────────────────────
 function injectSVGStyles(rawSvg) {
   if (!rawSvg) return "";
 
   let svg = rawSvg;
 
-  // 1. Remove Mermaid v11 inline max-width: 0px or height: 0px style collapse
+  // Remove restrictive max-width/height collapse from Mermaid v11
   svg = svg.replace(/style="([^"]*)"/gi, (match, styleContent) => {
     const cleanedStyle = styleContent
-      .replace(/max-width:\s*0px;?/gi, '')
-      .replace(/height:\s*0px;?/gi, '');
+      .replace(/max-width:\s*0px;?/gi, "")
+      .replace(/height:\s*0px;?/gi, "");
     return `style="width: 100%; height: auto; ${cleanedStyle}"`;
   });
 
-  // 2. Ensure svg root has width="100%"
+  // Ensure svg root has width="100%"
   svg = svg.replace(/<svg\s+([^>]*)/i, (match, attrs) => {
     let newAttrs = attrs;
     if (!/width=/i.test(newAttrs)) newAttrs += ' width="100%"';
@@ -59,8 +66,6 @@ function injectSVGStyles(rawSvg) {
       margin: 0 auto !important;
       background: transparent !important;
     }
-
-    /* Node Cards Fill & Border */
     .mermaid-svg-container svg .node rect,
     .mermaid-svg-container svg g.node rect,
     .mermaid-svg-container svg .node polygon,
@@ -73,8 +78,6 @@ function injectSVGStyles(rawSvg) {
       opacity: 1 !important;
       visibility: visible !important;
     }
-
-    /* Subgraph Cluster Boundaries */
     .mermaid-svg-container svg .cluster rect,
     .mermaid-svg-container svg g.cluster rect,
     .mermaid-svg-container svg g.cluster > rect {
@@ -85,8 +88,6 @@ function injectSVGStyles(rawSvg) {
       opacity: 1 !important;
       visibility: visible !important;
     }
-
-    /* Text Labels (Nodes, Edge Labels, Clusters) */
     .mermaid-svg-container svg text,
     .mermaid-svg-container svg tspan,
     .mermaid-svg-container svg .nodeLabel,
@@ -96,14 +97,12 @@ function injectSVGStyles(rawSvg) {
     .mermaid-svg-container svg text.actor {
       fill: #ffffff !important;
       color: #ffffff !important;
-      font-family: ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif !important;
+      font-family: ui-sans-serif, system-ui, sans-serif !important;
       font-size: 13px !important;
       font-weight: 600 !important;
       opacity: 1 !important;
       visibility: visible !important;
     }
-
-    /* Connector Paths & Flowchart Links */
     .mermaid-svg-container svg .edgePath path,
     .mermaid-svg-container svg .flowchart-link,
     .mermaid-svg-container svg path.path,
@@ -113,8 +112,6 @@ function injectSVGStyles(rawSvg) {
       opacity: 1 !important;
       visibility: visible !important;
     }
-
-    /* Edge Badges & Label Rectangles */
     .mermaid-svg-container svg .edgeLabel rect {
       fill: #090d16 !important;
       stroke: #374151 !important;
@@ -125,21 +122,20 @@ function injectSVGStyles(rawSvg) {
   return svg.replace(/<svg[^>]*>/, (match) => `${match}${customStyle}`);
 }
 
+// ── Mermaid code sanitizer ────────────────────────────────────────────────────
 function formatAndSanitizeMermaidCode(code) {
   if (!code) return "";
   let text = code.trim();
 
-  // 1. If single-line or missing newlines between statements, restore newlines
   if (!text.includes("\n") || text.split("\n").length < 3) {
     text = text
       .replace(/\s*(subgraph\s+[A-Za-z0-9_"\-[\]\s]+)/gi, "\n$1\n")
       .replace(/\s*(end)(?=\s|$)/gi, "\nend\n")
       .replace(/\s*(-->|->|-\.->|<-->)\s*/gi, " $1 ")
       .replace(/\]\s*([A-Za-z0-9_]+)\[/g, "]\n$1[")
-      .replace(/("\s*)([A-Za-z0-9_]+\[)/g, '$1\n$2');
+      .replace(/("?\s*)([A-Za-z0-9_]+\[)/g, "$1\n$2");
   }
 
-  // 2. Fix arrow label quirks
   text = text
     .replace(/-->\|([^|]+)\|>/g, "-->|$1|")
     .replace(/->\|([^|]+)\|>/g, "-->|$1|")
@@ -148,23 +144,20 @@ function formatAndSanitizeMermaidCode(code) {
     .replace(/style\s+\w+\s+fill:[^;\n]+;\s*/gi, "")
     .replace(/style\s+\w+\s+fill:[^;\n]+$/gi, "");
 
-  // 3. Ensure graph header
   if (!/^(graph|flowchart|sequenceDiagram|classDiagram|gantt|erDiagram)/i.test(text.trim())) {
     text = "graph TD\n" + text;
   }
 
-  // 4. Fix unquoted subgraph titles with spaces: subgraph Master Node => subgraph Master_Node["Master Node"]
   text = text.replace(/subgraph\s+([A-Za-z0-9_ ]+?)(?=\n|\[|$)/gi, (match, name) => {
     if (name.includes("[") || name.startsWith('"')) return match;
     const trimmed = name.trim();
     if (trimmed.includes(" ")) {
-      const safeId = trimmed.replace(/\s+/g, '_');
+      const safeId = trimmed.replace(/\s+/g, "_");
       return `subgraph ${safeId}["${trimmed}"]`;
     }
     return `subgraph ${trimmed}`;
   });
 
-  // 5. Wrap unquoted node labels containing spaces or special characters in quotes
   text = text.replace(/^(\s*)(\w+)\s*\[\s*([^"\n\]]+?)\s*\]/gm, (match, indent, id, label) => {
     if (label.startsWith('"') && label.endsWith('"')) return match;
     return `${indent}${id}["${label}"]`;
@@ -173,72 +166,41 @@ function formatAndSanitizeMermaidCode(code) {
   return text;
 }
 
+// ── Mermaid SVG viewport fitter ───────────────────────────────────────────────
 function fitSVGToViewBox(rawSvg) {
   if (typeof document === "undefined" || !rawSvg) return rawSvg;
-
   try {
     const tempContainer = document.createElement("div");
-    tempContainer.style.position = "absolute";
-    tempContainer.style.visibility = "hidden";
-    tempContainer.style.top = "-9999px";
-    tempContainer.style.left = "-9999px";
-    tempContainer.style.width = "1200px";
+    tempContainer.style.cssText = "position:absolute;visibility:hidden;top:-9999px;left:-9999px;width:1200px;";
     tempContainer.innerHTML = rawSvg;
     document.body.appendChild(tempContainer);
-
     const svgElem = tempContainer.querySelector("svg");
     if (svgElem) {
-      // 1. Log SVG DOM Element Counts for Diagnosis
-      console.log("[Mermaid SVG DOM Inspection]", {
-        nodeGroups: svgElem.querySelectorAll("g.node, .node").length,
-        rectangles: svgElem.querySelectorAll("rect").length,
-        polygons: svgElem.querySelectorAll("polygon").length,
-        textElements: svgElem.querySelectorAll("text, tspan").length,
-        foreignObjects: svgElem.querySelectorAll("foreignObject").length,
-        styleElements: svgElem.querySelectorAll("style").length,
-        edgePaths: svgElem.querySelectorAll(".edgePath path, .flowchart-link, path").length,
-      });
-
-      // 2. Remove restrictive max-width / height attributes & inline style
       svgElem.removeAttribute("style");
       svgElem.setAttribute("style", "width: 100%; height: auto; display: block; margin: 0 auto;");
       svgElem.setAttribute("width", "100%");
       svgElem.removeAttribute("height");
-
-      // 3. Query root group & calculate actual BBox
       const rootGroup = svgElem.querySelector("g");
       if (rootGroup && typeof rootGroup.getBBox === "function") {
         const bbox = rootGroup.getBBox();
-
-        console.log("[Mermaid Viewport Diagnostics]", {
-          svgViewBox: svgElem.getAttribute("viewBox"),
-          svgWidth: svgElem.getAttribute("width"),
-          svgHeight: svgElem.getAttribute("height"),
-          svgRect: svgElem.getBoundingClientRect(),
-          groupBBox: bbox,
-          groupTransform: rootGroup.getAttribute("transform"),
-        });
-
         if (bbox && bbox.width > 0 && bbox.height > 0) {
           const padding = 24;
-          const minX = bbox.x - padding;
-          const minY = bbox.y - padding;
-          const width = bbox.width + padding * 2;
-          const height = bbox.height + padding * 2;
-          svgElem.setAttribute("viewBox", `${minX} ${minY} ${width} ${height}`);
+          svgElem.setAttribute(
+            "viewBox",
+            `${bbox.x - padding} ${bbox.y - padding} ${bbox.width + padding * 2} ${bbox.height + padding * 2}`
+          );
         }
       }
     }
-
     const processedSvg = tempContainer.innerHTML;
     document.body.removeChild(tempContainer);
     return processedSvg;
-  } catch (err) {
-    console.warn("SVG viewBox auto-fit fallback:", err);
+  } catch {
     return rawSvg;
   }
 }
 
+// ── MermaidDiagram component ──────────────────────────────────────────────────
 function MermaidDiagram({ code }) {
   const [mounted, setMounted] = useState(false);
   const [svgHtml, setSvgHtml] = useState(null);
@@ -246,21 +208,15 @@ function MermaidDiagram({ code }) {
   const [error, setError] = useState(false);
   const [showCode, setShowCode] = useState(false);
   const containerRef = useRef(null);
-
-  // Generate unique diagram ID per instance to avoid DOM collisions
   const uniqueIdRef = useRef(`mermaid-${Math.random().toString(36).substring(2, 9)}`);
 
-  useEffect(() => {
-    setMounted(true);
-  }, []);
+  useEffect(() => { setMounted(true); }, []);
 
   useEffect(() => {
     if (!mounted || !code) return;
-
     let isSubscribed = true;
     setLoading(true);
     setError(false);
-
     const formattedCode = formatAndSanitizeMermaidCode(code);
     const diagramId = uniqueIdRef.current;
 
@@ -272,22 +228,16 @@ function MermaidDiagram({ code }) {
           setSvgHtml(injectSVGStyles(autoFittedSvg));
           setLoading(false);
         }
-      } catch (primaryErr) {
-        console.warn("Primary Mermaid render failed, trying simplified fallback...", primaryErr);
+      } catch {
         try {
-          const fallbackCode = formattedCode.replace(/\|([^|]+)\|/g, '');
+          const fallbackCode = formattedCode.replace(/\|([^|]+)\|/g, "");
           const { svg: rawSvg } = await mermaid.render(`${diagramId}-fb`, fallbackCode);
           if (isSubscribed) {
-            const autoFittedSvg = fitSVGToViewBox(rawSvg);
-            setSvgHtml(injectSVGStyles(autoFittedSvg));
+            setSvgHtml(injectSVGStyles(fitSVGToViewBox(rawSvg)));
             setLoading(false);
           }
-        } catch (fallbackErr) {
-          console.error("Mermaid diagram render error:", fallbackErr);
-          if (isSubscribed) {
-            setError(true);
-            setLoading(false);
-          }
+        } catch {
+          if (isSubscribed) { setError(true); setLoading(false); }
         }
       } finally {
         document.querySelectorAll("[id^='dmermaid']").forEach((el) => el.remove());
@@ -295,50 +245,44 @@ function MermaidDiagram({ code }) {
     };
 
     renderDiagram();
-
-    return () => {
-      isSubscribed = false;
-    };
+    return () => { isSubscribed = false; };
   }, [mounted, code]);
 
-  if (!mounted) {
-    return <div className="my-4 h-32 bg-[#030712] border border-indigo-500/20 rounded-2xl animate-pulse flex items-center justify-center text-xs text-slate-500">Initializing Diagram Engine...</div>;
-  }
+  if (!mounted) return (
+    <div className="my-4 h-32 bg-[#030712] border border-indigo-500/20 rounded-2xl animate-pulse flex items-center justify-center text-xs text-slate-500">
+      Initializing Diagram Engine...
+    </div>
+  );
 
-  if (loading) {
-    return (
-      <div className="my-4 p-6 bg-[#030712] border border-indigo-500/20 rounded-2xl flex flex-col items-center justify-center gap-3 shadow-xl">
-        <Activity className="animate-spin text-indigo-400 w-5 h-5" />
-        <span className="text-xs font-medium text-slate-400">Rendering Architecture Topology...</span>
-      </div>
-    );
-  }
+  if (loading) return (
+    <div className="my-4 p-6 bg-[#030712] border border-indigo-500/20 rounded-2xl flex flex-col items-center justify-center gap-3 shadow-xl">
+      <Activity className="animate-spin text-indigo-400 w-5 h-5" />
+      <span className="text-xs font-medium text-slate-400">Rendering Diagram...</span>
+    </div>
+  );
 
-  if (error) {
-    return (
-      <div className="my-4 p-4 bg-slate-950/90 border border-amber-500/30 rounded-2xl shadow-lg">
-        <div className="flex items-center justify-between">
-          <div className="flex items-center gap-2 text-amber-400 text-xs font-semibold">
-            <AlertTriangle size={15} />
-            <span>Architecture Diagram Topology</span>
-          </div>
-          <button
-            onClick={() => setShowCode(!showCode)}
-            className="flex items-center gap-1 text-[11px] text-slate-400 hover:text-white px-2.5 py-1 rounded-md bg-white/5 border border-white/10 transition-colors cursor-pointer"
-          >
-            {showCode ? <ChevronDown size={13} /> : <ChevronRight size={13} />}
-            <span>{showCode ? "Hide Diagram Code" : "View Diagram Code"}</span>
-          </button>
+  if (error) return (
+    <div className="my-4 p-4 bg-slate-950/90 border border-amber-500/30 rounded-2xl shadow-lg">
+      <div className="flex items-center justify-between">
+        <div className="flex items-center gap-2 text-amber-400 text-xs font-semibold">
+          <AlertTriangle size={15} />
+          <span>Mermaid Diagram</span>
         </div>
-
-        {showCode && (
-          <div className="mt-3 p-3 bg-black/60 rounded-xl border border-white/10 font-mono text-xs text-slate-300 overflow-x-auto">
-            <pre className="text-indigo-300 leading-relaxed">{formatAndSanitizeMermaidCode(code)}</pre>
-          </div>
-        )}
+        <button
+          onClick={() => setShowCode(!showCode)}
+          className="flex items-center gap-1 text-[11px] text-slate-400 hover:text-white px-2.5 py-1 rounded-md bg-white/5 border border-white/10 transition-colors cursor-pointer"
+        >
+          {showCode ? <ChevronDown size={13} /> : <ChevronRight size={13} />}
+          <span>{showCode ? "Hide Code" : "View Code"}</span>
+        </button>
       </div>
-    );
-  }
+      {showCode && (
+        <div className="mt-3 p-3 bg-black/60 rounded-xl border border-white/10 font-mono text-xs text-slate-300 overflow-x-auto">
+          <pre className="text-indigo-300 leading-relaxed">{formatAndSanitizeMermaidCode(code)}</pre>
+        </div>
+      )}
+    </div>
+  );
 
   return (
     <div className="my-4 group relative bg-[#030712] border border-indigo-500/20 rounded-2xl shadow-xl shadow-black/50 overflow-hidden">
@@ -349,14 +293,14 @@ function MermaidDiagram({ code }) {
       />
       <div className="px-4 py-2 bg-slate-950/80 border-t border-white/5 flex items-center justify-between text-[11px] text-slate-500">
         <span className="flex items-center gap-1.5 text-indigo-400 font-medium">
-          <Zap size={12} /> Interactive Architecture Topology
+          <Zap size={12} /> Mermaid Diagram
         </span>
         <button
           onClick={() => setShowCode(!showCode)}
           className="flex items-center gap-1 text-slate-400 hover:text-white transition-colors cursor-pointer"
         >
           {showCode ? <ChevronDown size={12} /> : <ChevronRight size={12} />}
-          <span>{showCode ? "Hide Diagram Code" : "View Diagram Code"}</span>
+          <span>{showCode ? "Hide Code" : "View Code"}</span>
         </button>
       </div>
       {showCode && (
@@ -368,99 +312,109 @@ function MermaidDiagram({ code }) {
   );
 }
 
+// ── Visual response parser ────────────────────────────────────────────────────
+function tryParseVisualResponse(content) {
+  if (!content || typeof content !== "string") return null;
+  const trimmed = content.trim();
+  if (!trimmed.startsWith("{")) return null;
+  try {
+    const data = JSON.parse(trimmed);
+    if (data.type === "visual_response") return data;
+  } catch {}
+  return null;
+}
+
+// ── Visual response renderer ──────────────────────────────────────────────────
+function VisualResponseBlock({ data, onEdit }) {
+  const [showExplanation, setShowExplanation] = useState(true);
+  const visual = data.visual;
+
+  return (
+    <div className="space-y-3">
+      {/* Title */}
+      {data.title && (
+        <h3 className="text-sm font-bold text-slate-100 mb-1">{data.title}</h3>
+      )}
+
+      {/* Introduction */}
+      {data.introduction && (
+        <p className="text-sm text-slate-300 leading-relaxed">{data.introduction}</p>
+      )}
+
+      {/* Visual */}
+      {visual?.kind === "generated_image" && visual.url && (
+        <GeneratedVisualCard
+          visual={visual}
+          title={data.title}
+          onEdit={onEdit}
+        />
+      )}
+
+      {visual?.kind === "structured_diagram" && visual.spec && (
+        <StructuredDiagramCard spec={visual.spec} title={data.title} />
+      )}
+
+      {/* Visual error */}
+      {data.visual_error && (
+        <VisualErrorState
+          errorCode={data.visual_error.error_code}
+          title={data.title}
+        />
+      )}
+
+      {/* Explanation sections */}
+      {data.sections && data.sections.length > 0 && (
+        <div>
+          <button
+            onClick={() => setShowExplanation(!showExplanation)}
+            className="flex items-center gap-1 text-xs text-slate-400 hover:text-white mb-2 transition-colors cursor-pointer"
+          >
+            {showExplanation ? <ChevronDown size={13} /> : <ChevronRight size={13} />}
+            <span>{showExplanation ? "Hide Explanation" : "Show Explanation"}</span>
+          </button>
+          {showExplanation && (
+            <div className="space-y-3 mt-2">
+              {data.sections.map((section, i) => (
+                <div key={i} className="p-3 rounded-xl bg-white/3 border border-white/8">
+                  <p className="text-[11px] text-indigo-400 uppercase tracking-wider font-semibold mb-1.5">
+                    {section.heading}
+                  </p>
+                  <p className="text-xs text-slate-300 leading-relaxed">{section.content}</p>
+                </div>
+              ))}
+            </div>
+          )}
+        </div>
+      )}
+
+      {/* Key takeaway */}
+      {data.key_takeaway && (
+        <div className="p-3 rounded-xl bg-indigo-500/8 border border-indigo-500/20 mt-2">
+          <p className="text-[10px] text-indigo-400 uppercase tracking-wider font-semibold mb-1">
+            Key Takeaway
+          </p>
+          <p className="text-xs text-slate-200 leading-relaxed">{data.key_takeaway}</p>
+        </div>
+      )}
+    </div>
+  );
+}
+
+// ── Markdown preprocessor — STRIPPED of all hardcoded Mermaid injection ──────
 function preprocessMarkdownContent(content) {
   if (!content) return "";
   let processed = content;
 
-  // 1. Fix code blocks like ``` \n graph TD ... ``` that missed the 'mermaid' language identifier
-  processed = processed.replace(/```\s*\n(graph\s+(?:TD|LR|TB|RL)|flowchart\s+(?:TD|LR|TB|RL)|sequenceDiagram|classDiagram|erDiagram|gantt)/gi, '```mermaid\n$1');
-
-  // 2. Auto-wrap unfenced graph/flowchart code blocks
-  if (!processed.includes("```mermaid")) {
-    const unfencedRegex = /((?:graph\s+(?:TD|LR|TB|RL)|flowchart\s+(?:TD|LR|TB|RL)|sequenceDiagram)[\s\S]+?)(?=\n\n[A-Z]|\n\n#|\n\n1\.|\n\nThis architecture|$)/i;
-    if (unfencedRegex.test(processed)) {
-      processed = processed.replace(unfencedRegex, "```mermaid\n$1\n```");
-    }
-  }
-
-  // 3. Auto-fallback for text mentioning CI/CD / pipelines when NO ```mermaid block exists!
-  if (!processed.includes("```mermaid")) {
-    const isCICD = /CI\/CD|pipeline|Development Layer|GitHub Actions|Docker Hub|EC2 instances|Build Service/i.test(processed);
-    if (isCICD) {
-      const cicdDiagram = `\`\`\`mermaid
-graph LR
-    subgraph DevLayer["💻 Development Layer"]
-        Repo["📝 GitHub Repository"] -->|Code Push| Workflow["⚡ GitHub Actions Workflow"]
-    end
-
-    subgraph CIPipeline["🔨 CI Pipeline"]
-        Workflow -->|Trigger| DockerBuild["🐳 Build Service (Docker)"]
-        DockerBuild -->|Image Push| Registry["📦 Artifact Registry (Docker Hub)"]
-    end
-
-    subgraph CDPipeline["🚀 CD Pipeline"]
-        Registry -->|Pull Image| DeploySvc["☁️ Deployment Service (AWS ECS)"]
-        DeploySvc -->|Deploy| EC2["🖥️ EC2 Instances (AWS)"]
-    end
-
-    subgraph Observability["📊 Observability & Alerting"]
-        EC2 -->|Logs & Metrics| CW["📈 CloudWatch Logs & Metrics"]
-        CW -->|Alerts| SNS["🔔 Alerting Service (AWS SNS)"]
-    end
-\`\`\`\n\n`;
-      processed = cicdDiagram + processed;
-    } else if (/kubernetes|k8s|master_node|master node|etcd|kubelet|api server|control plane/i.test(processed)) {
-      const k8sDiagram = `\`\`\`mermaid
-graph TD
-    subgraph Master_Control_Plane["☸️ Kubernetes Control Plane (Master Node)"]
-        APIServer["⚡ API Server (kube-apiserver)"]
-        ETCD["🗄️ etcd (State Store)"]
-        Controller["⚙️ Controller Manager"]
-        Scheduler["📅 Kube-Scheduler"]
-
-        APIServer <--> ETCD
-        APIServer <--> Controller
-        APIServer <--> Scheduler
-    end
-
-    subgraph Worker_Nodes["🖥️ Worker Nodes (Compute Cluster)"]
-        Kubelet["🔌 Kubelet Agent"]
-        Proxy["🌐 Kube-Proxy Network"]
-        Pods["📦 Container Pods"]
-
-        Kubelet --> APIServer
-        Proxy --> APIServer
-        Kubelet --> Pods
-    end
-\`\`\`\n\n`;
-      processed = k8sDiagram + processed;
-    } else if (/VNet 1|VNet 2|VNet 3|VNet peering|Virtual Network/i.test(processed)) {
-      const vnetDiagram = `\`\`\`mermaid
-graph LR
-    subgraph Azure_Network["☁️ Azure Region (Virtual Networks)"]
-        direction LR
-        subgraph VNet1_Box["🌐 VNet 1"]
-            VNet1["VNet 1 (Hub / Origin)"]
-        end
-        subgraph VNet2_Box["🌐 VNet 2"]
-            VNet2["VNet 2 (Transit Gateway / Router)"]
-        end
-        subgraph VNet3_Box["🌐 VNet 3"]
-            VNet3["VNet 3 (Spoke Target)"]
-        end
-    end
-
-    VNet1 -->|Direct VNet Peering| VNet2
-    VNet2 -->|Direct VNet Peering| VNet3
-    VNet1 -.->|Transitive Routing via VNet 2| VNet3
-\`\`\`\n\n`;
-      processed = vnetDiagram + processed;
-    }
-  }
+  // Only fix code blocks that have the mermaid language already but missing identifier
+  processed = processed.replace(
+    /```\s*\n(graph\s+(?:TD|LR|TB|RL)|flowchart\s+(?:TD|LR|TB|RL)|sequenceDiagram|classDiagram|erDiagram|gantt)/gi,
+    "```mermaid\n$1"
+  );
 
   return processed;
 }
 
+// ── Time formatter ────────────────────────────────────────────────────────────
 function timeAgo(iso) {
   if (!iso) return "";
   const secs = Math.floor((Date.now() - new Date(iso)) / 1000);
@@ -470,10 +424,13 @@ function timeAgo(iso) {
   return new Date(iso).toLocaleDateString();
 }
 
+// ── MessageBubble ─────────────────────────────────────────────────────────────
 export function MessageBubble({ msg, onRetry }) {
   const isRCA = msg.rca_data && (msg.rca_data.investigation_id || msg.rca_data.probable_root_cause);
   const isError = msg.is_error;
-  const processedContent = preprocessMarkdownContent(msg.content);
+
+  // Check for structured visual response
+  const visualData = tryParseVisualResponse(msg.content);
 
   if (isError) {
     return (
@@ -510,6 +467,11 @@ export function MessageBubble({ msg, onRetry }) {
       <div className="max-w-[85%] min-w-[200px] px-4 py-3 rounded-2xl rounded-tl-sm bg-white/4 border border-white/8 text-slate-300 shadow-sm">
         {isRCA ? (
           <RCADisplay data={msg.rca_data} />
+        ) : visualData ? (
+          <VisualResponseBlock
+            data={visualData}
+            onEdit={onRetry ? (followUp) => onRetry(followUp) : undefined}
+          />
         ) : (
           <div className="prose-sm max-w-none text-sm leading-relaxed">
             <ReactMarkdown
@@ -517,19 +479,26 @@ export function MessageBubble({ msg, onRetry }) {
                 pre({ children }) {
                   return <>{children}</>;
                 },
-                code({ className, children, node, ...props }) {
+                code({ className, children, ...props }) {
                   const match = /language-(\w+)/.exec(className || "");
                   const language = match ? match[1] : "";
                   const codeString = String(children).replace(/\n$/, "");
                   const isInline = !className && !codeString.includes("\n");
 
-                  if (language === "mermaid" || codeString.trim().startsWith("graph ") || codeString.trim().startsWith("flowchart ")) {
+                  if (
+                    language === "mermaid" ||
+                    codeString.trim().startsWith("graph ") ||
+                    codeString.trim().startsWith("flowchart ")
+                  ) {
                     return <MermaidDiagram code={codeString} />;
                   }
 
                   if (isInline) {
                     return (
-                      <code className="bg-slate-800/80 text-indigo-300 px-1.5 py-0.5 rounded text-xs font-mono inline border border-indigo-500/20" {...props}>
+                      <code
+                        className="bg-slate-800/80 text-indigo-300 px-1.5 py-0.5 rounded text-xs font-mono inline border border-indigo-500/20"
+                        {...props}
+                      >
                         {children}
                       </code>
                     );
@@ -546,9 +515,11 @@ export function MessageBubble({ msg, onRetry }) {
                 ul: ({ ...props }) => <ul className="list-disc pl-5 space-y-1 my-2" {...props} />,
                 ol: ({ ...props }) => <ol className="list-decimal pl-5 space-y-1 my-2" {...props} />,
                 p: ({ ...props }) => <p className="mb-2 last:mb-0" {...props} />,
+                h2: ({ ...props }) => <h2 className="text-sm font-bold text-slate-100 mt-3 mb-1.5" {...props} />,
+                h3: ({ ...props }) => <h3 className="text-xs font-bold text-slate-200 mt-2 mb-1" {...props} />,
               }}
             >
-              {processedContent}
+              {preprocessMarkdownContent(msg.content)}
             </ReactMarkdown>
           </div>
         )}
@@ -560,6 +531,7 @@ export function MessageBubble({ msg, onRetry }) {
   );
 }
 
+// ── ErrorCard ─────────────────────────────────────────────────────────────────
 function ErrorCard({ error, onRetry }) {
   const [showDetails, setShowDetails] = useState(false);
   const [copied, setCopied] = useState(false);
@@ -581,32 +553,29 @@ function ErrorCard({ error, onRetry }) {
           <p className="text-xs text-rose-300/80 leading-relaxed">{error?.message}</p>
         </div>
       </div>
-
       <div className="flex items-center gap-2 flex-wrap">
         {error?.retryable && onRetry && (
           <button
             onClick={onRetry}
-            className="flex items-center gap-1.5 px-3 py-1.5 rounded-lg bg-indigo-600/20 border border-indigo-500/30 text-indigo-300 text-xs hover:bg-indigo-600/30 transition-colors"
+            className="flex items-center gap-1.5 px-3 py-1.5 rounded-lg bg-indigo-600/20 border border-indigo-500/30 text-indigo-300 text-xs hover:bg-indigo-600/30 transition-colors cursor-pointer"
           >
-            <RefreshCw size={11} />
-            Retry
+            <RefreshCw size={11} /> Retry
           </button>
         )}
         {error?.request_id && (
           <button
             onClick={copyRequestId}
-            className="flex items-center gap-1.5 px-2.5 py-1.5 rounded-lg bg-white/5 border border-white/8 text-slate-400 text-xs hover:bg-white/8 transition-colors"
+            className="flex items-center gap-1.5 px-2.5 py-1.5 rounded-lg bg-white/5 border border-white/8 text-slate-400 text-xs hover:bg-white/8 transition-colors cursor-pointer"
           >
             <Copy size={11} />
             {copied ? "Copied!" : "Copy ID"}
           </button>
         )}
       </div>
-
       {error?.request_id && (
         <button
           onClick={() => setShowDetails((v) => !v)}
-          className="flex items-center gap-1 text-[10px] text-slate-600 hover:text-slate-500 mt-2 transition-colors"
+          className="flex items-center gap-1 text-[10px] text-slate-600 hover:text-slate-500 mt-2 transition-colors cursor-pointer"
         >
           <Info size={9} />
           {showDetails ? "Hide" : "Show"} technical details
@@ -622,6 +591,7 @@ function ErrorCard({ error, onRetry }) {
   );
 }
 
+// ── RCADisplay ────────────────────────────────────────────────────────────────
 function RCADisplay({ data }) {
   const [showTools, setShowTools] = useState(false);
   const [showEvidence, setShowEvidence] = useState(false);
@@ -641,14 +611,12 @@ function RCADisplay({ data }) {
           </div>
         </div>
       )}
-
       {data.incident_summary && (
         <div className="p-3 rounded-xl bg-white/4 border border-white/8">
           <p className="text-[10px] text-slate-500 uppercase tracking-wider mb-1">Incident Summary</p>
           <p className="text-xs text-slate-200 leading-relaxed">{data.incident_summary}</p>
         </div>
       )}
-
       {data.probable_root_cause && (
         <div className="p-3 rounded-xl bg-indigo-500/8 border border-indigo-500/20">
           <div className="flex items-center justify-between mb-1.5">
@@ -662,14 +630,12 @@ function RCADisplay({ data }) {
           <p className="text-xs text-slate-200 leading-relaxed">{data.probable_root_cause}</p>
         </div>
       )}
-
       {data.impact && (
         <div className="p-3 rounded-xl bg-white/3 border border-white/8">
           <p className="text-[10px] text-slate-500 uppercase tracking-wider mb-1">Impact</p>
           <p className="text-xs text-slate-300 leading-relaxed">{data.impact}</p>
         </div>
       )}
-
       {data.recommended_resolution && (
         <div className="p-3 rounded-xl bg-emerald-500/6 border border-emerald-500/15">
           <p className="text-[10px] text-emerald-400 uppercase tracking-wider mb-1">Recommended Resolution</p>
@@ -678,12 +644,11 @@ function RCADisplay({ data }) {
           </div>
         </div>
       )}
-
       {data.live_evidence && data.live_evidence.length > 0 && (
         <div>
           <button
             onClick={() => setShowEvidence((v) => !v)}
-            className="flex items-center gap-2 text-xs text-slate-400 hover:text-slate-300 mb-2"
+            className="flex items-center gap-2 text-xs text-slate-400 hover:text-slate-300 mb-2 cursor-pointer"
           >
             {showEvidence ? <ChevronDown size={13} /> : <ChevronRight size={13} />}
             <Zap size={11} className="text-cyan-400" />
@@ -704,7 +669,6 @@ function RCADisplay({ data }) {
           )}
         </div>
       )}
-
       <div className="flex items-center gap-3 text-[10px] text-slate-600 pt-1 border-t border-white/4">
         {data.investigation_duration_seconds && (
           <span className="flex items-center gap-1">

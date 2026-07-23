@@ -26,6 +26,7 @@ services:
       - "3000:3000"
     environment:
       - NEXT_PUBLIC_API_BASE_URL=/api
+      # OPENAI_API_KEY is intentionally NOT passed to the frontend container
     depends_on:
       - api-gateway-service
     restart: unless-stopped
@@ -37,8 +38,11 @@ services:
       - "8000:8000"
     env_file:
       - .env
+    environment:
+      - VISUAL_STORAGE_DIR=/app/data/visuals
     volumes:
       - ./data:/app/data
+      - generated_visuals:/app/data/visuals
     depends_on:
       postgres:
         condition: service_healthy
@@ -119,6 +123,11 @@ services:
       - "8005:8000"
     env_file:
       - .env
+    environment:
+      - VISUAL_STORAGE_DIR=/app/data/visuals
+      - OPENAI_MODEL=${OPENAI_MODEL_NAME:-gpt-4o-mini}
+    volumes:
+      - generated_visuals:/app/data/visuals
     depends_on:
       - mcp-server-service
     healthcheck:
@@ -139,3 +148,5 @@ services:
 
 volumes:
   postgres_data:
+  generated_visuals:
+

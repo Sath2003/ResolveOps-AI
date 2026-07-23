@@ -76,6 +76,30 @@ class Settings:
     )
     RAG_MAX_RESULTS: int = int(os.getenv("RAG_MAX_RESULTS", "10"))
 
+    # ── Visual Generation ─────────────────────────────────────────────────────
+    VISUAL_GENERATION_ENABLED: bool = (
+        os.getenv("VISUAL_GENERATION_ENABLED", "true").lower() == "true"
+    )
+    # DALL-E 3 supports: dall-e-3, dall-e-2
+    OPENAI_IMAGE_MODEL: str = os.getenv("OPENAI_IMAGE_MODEL", "dall-e-3")
+    # DALL-E 3 quality: hd | standard
+    OPENAI_IMAGE_QUALITY: str = os.getenv("OPENAI_IMAGE_QUALITY", "hd")
+    # DALL-E 3 landscape: 1792x1024, portrait: 1024x1792, square: 1024x1024
+    OPENAI_IMAGE_SIZE: str = os.getenv("OPENAI_IMAGE_SIZE", "1792x1024")
+    OPENAI_IMAGE_FORMAT: str = os.getenv("OPENAI_IMAGE_FORMAT", "png")
+    VISUAL_STORAGE_PROVIDER: str = os.getenv("VISUAL_STORAGE_PROVIDER", "local")
+    VISUAL_STORAGE_DIR: str = os.getenv("VISUAL_STORAGE_DIR", "/app/data/visuals")
+    VISUAL_GENERATION_TIMEOUT_SECONDS: float = float(
+        os.getenv("VISUAL_GENERATION_TIMEOUT_SECONDS", "120")
+    )
+    VISUAL_MAX_REQUESTS_PER_USER: int = int(
+        os.getenv("VISUAL_MAX_REQUESTS_PER_USER", "10")
+    )
+    VISUAL_CACHE_ENABLED: bool = (
+        os.getenv("VISUAL_CACHE_ENABLED", "true").lower() == "true"
+    )
+    VISUAL_MAX_COMPONENTS: int = int(os.getenv("VISUAL_MAX_COMPONENTS", "30"))
+
     # ── Internal Services ────────────────────────────────────────────────────
     AWS_INTELLIGENCE_SERVICE_URL: str = os.getenv(
         "AWS_INTELLIGENCE_SERVICE_URL", "http://aws-intelligence-service:8000"

@@ -22,6 +22,7 @@ class ChatRequest(BaseModel):
     session_id: Optional[str] = None
     tenant_id: Optional[str] = None
     image_base64: Optional[str] = None
+    previous_visual_spec: Optional[dict] = None  # For conversational visual editing
 
 
 class EvidenceItem(BaseModel):

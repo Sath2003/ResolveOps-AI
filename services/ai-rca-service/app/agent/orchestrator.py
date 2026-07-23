@@ -70,19 +70,30 @@ You answer questions about:
 - CloudWatch & Azure Monitor metrics and logs
 - Cost and reliability analysis
 
-CRITICAL MANDATE FOR ALL ARCHITECTURE, NETWORK & DIAGRAM RESPONSES:
-1. Whenever your answer discusses, explains, or describes network topology (such as VNets, VPCs, subnets, routers, peering), cloud architecture, flowcharts, or infrastructure components, YOU MUST ALWAYS INCLUDE A VISUAL MERMAID CODE BLOCK (```mermaid ... ```).
-2. NEVER write phrases like "In this diagram...", "Below is a diagram...", or "As shown in the diagram..." WITHOUT INCLUDING THE EXPLICIT ```mermaid ... ``` CODE BLOCK IN THE EXACT SAME RESPONSE.
-3. SYNTAX RULES FOR MERMAID:
-   - Always start with `graph LR` or `graph TD`.
-   - ALWAYS assign unique alphanumeric node IDs before node labels, e.g. `VNet1["🌐 VNet 1 (Hub / Origin)"]`.
-   - ALWAYS double-quote node labels containing spaces, parentheses, slashes, or special characters (e.g. `VNet2["🌐 VNet 2 (Transit Gateway)"]`).
-   - Use standard arrow connections like `A -->|Direct Peering| B` or `A -.->|Transitive Route| B`. NEVER add trailing `>` like `|Label|>`.
-   - Group components logically using `subgraph` blocks (e.g. `subgraph Azure_Network`, `subgraph App_Layer`).
-   - Include clear visual icons / emojis in node labels (e.g. 🌐 VNet, 🖥️ Subnet, 🗄️ Database, ⚡ Gateway).
-4. ALWAYS put each Mermaid statement on a new line with explicit line breaks (`\n`). NEVER concatenate multiple statements onto a single line.
+Be precise, evidence-based, concise, and structured.
+When returning a written explanation for an architecture topic, use clear sections with headings.
+Do NOT embed Mermaid code blocks unless the user explicitly requests Mermaid.
+The visual pipeline handles diagram and image generation separately.
+"""
 
-Be precise, evidence-based, concise, and structured. Always provide both the visual diagram block and clear text explanation with bullet points.
+_EXPLANATION_SYSTEM_PROMPT = """You are a technical writer for ResolveOps AI.
+You receive a VisualSpec JSON and the user's question.
+Write a structured explanation matching the visual exactly.
+
+Rules:
+- Only mention components listed in the VisualSpec
+- Use section headings matching the spec sections
+- Describe flows and relationships clearly
+- Keep the explanation concise and factual
+
+Return ONLY a valid JSON object:
+{
+  "introduction": "One or two sentence introduction",
+  "sections": [
+    {"heading": "Section Name", "content": "Explanation paragraph", "component_ids": ["id1"]}
+  ],
+  "key_takeaway": "One sentence key insight"
+}
 """
 
 
@@ -215,68 +226,364 @@ class InvestigationOrchestrator:
         message: str,
         session_id: Optional[str] = None,
         tenant_id: Optional[str] = None,
+        previous_visual_spec: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
-        """Handle a conversational chat request."""
+        """
+        Handle a conversational chat request using the hybrid visual generation pipeline.
+
+        Steps:
+          1. Classify the request intent (TEXT, CODE, CHART, MERMAID, STRUCTURED, IMAGE, MIXED)
+          2. For visual intents: plan a VisualSpec via two-stage planner
+          3. Validate the spec
+          4. Route to the correct renderer (image gen / structured diagram / mermaid / text)
+          5. Generate a matching explanation
+          6. Return a structured response the frontend can parse
+        """
+        import json as _json
+        import re as _re
+
+        from app.visual.intent_classifier import classify_intent
+        from app.visual.planner import plan_visual_spec
+        from app.visual.schemas import ResponseIntent, RenderEngine, VisualSpec
+
         request_id = str(uuid.uuid4())
+        visual_id = str(uuid.uuid4())
 
         logger.info(
-            "Chat request via ai-rca-service",
+            "Chat request received",
             extra={"request_id": request_id, "session_id": session_id},
         )
 
-        try:
-            answer = await asyncio.to_thread(
-                bedrock_client.invoke,
-                message,
-                _CHAT_SYSTEM_PROMPT,
-                max_tokens=2048,
-                temperature=0.3,
+        # ── Shared invoke wrapper ─────────────────────────────────────────────
+        def _invoke(prompt: str, system_prompt: Optional[str] = None,
+                    max_tokens: int = 2048, temperature: float = 0.3) -> str:
+            return bedrock_client.invoke(
+                prompt=prompt,
+                system_prompt=system_prompt,
+                max_tokens=max_tokens,
+                temperature=temperature,
                 request_id=request_id,
             )
 
-            # Check if user requested a visual architecture diagram image
-            msg_lower = message.lower()
-            if any(k in msg_lower for k in ["diagram", "architecture image", "draw architecture", "visual topology", "generate image"]):
-                data_uri = await asyncio.to_thread(
-                    bedrock_client.generate_diagram_image,
-                    message,
-                    request_id
-                )
-                if data_uri:
-                    answer += f"\n\n### 🎨 Generated Architecture Diagram\n![Architecture Diagram]({data_uri})"
-        except _SafeError as exc:
-            # Return structured error for chat — caller renders friendly card
-            return {
-                "request_id": request_id,
-                "session_id": session_id,
-                "answer": None,
-                "execution_path": "ai_rca_chat",
-                "provider": settings.AI_PROVIDER,
-                "model": settings.BEDROCK_MODEL_ID,
-                **exc.response,
-            }
+        # ── Step 1: Classify intent ────────────────────────────────────────────
+        try:
+            intent = classify_intent(message=message, invoke_fn=_invoke)
         except Exception as exc:
-            code = classify_provider_exception(exc)
-            err = build_error_response(code, request_id)
+            logger.warning(f"Intent classification failed: {exc}; defaulting to TEXT")
+            intent = ResponseIntent.TEXT
+
+        logger.info("Intent classified", extra={"intent": intent, "request_id": request_id})
+
+        # ── Step 2: Non-visual intents → plain LLM response ──────────────────
+        non_visual_intents = {
+            ResponseIntent.TEXT,
+            ResponseIntent.CODE,
+            ResponseIntent.TABLE,
+            ResponseIntent.CHART,
+        }
+
+        if intent == ResponseIntent.MERMAID_DIAGRAM:
+            # User explicitly asked for Mermaid — pass through to LLM with Mermaid instructions
+            mermaid_system = (
+                "You are a technical diagram assistant. "
+                "Return a Mermaid diagram in a ```mermaid code block. "
+                "Use graph TD or graph LR. Always quote labels with spaces. "
+                "Do not add explanatory text outside the code block unless asked."
+            )
+            try:
+                answer = await asyncio.to_thread(
+                    _invoke, message, mermaid_system, 2048, 0.2
+                )
+            except _SafeError as exc:
+                return self._chat_error_response(request_id, session_id, exc.response)
+            except Exception as exc:
+                code = classify_provider_exception(exc)
+                return self._chat_error_response(
+                    request_id, session_id, build_error_response(code, request_id)
+                )
             return {
                 "request_id": request_id,
                 "session_id": session_id,
-                "answer": None,
-                "execution_path": "ai_rca_chat",
-                "provider": settings.AI_PROVIDER,
-                "model": settings.BEDROCK_MODEL_ID,
-                **err,
+                "answer": answer,
+                "execution_path": "mermaid_direct",
+                "response_type": "MERMAID_DIAGRAM",
+                "status": "success",
             }
 
+        if intent in non_visual_intents:
+            try:
+                answer = await asyncio.to_thread(
+                    _invoke, message, _CHAT_SYSTEM_PROMPT, 2048, 0.3
+                )
+            except _SafeError as exc:
+                return self._chat_error_response(request_id, session_id, exc.response)
+            except Exception as exc:
+                code = classify_provider_exception(exc)
+                return self._chat_error_response(
+                    request_id, session_id, build_error_response(code, request_id)
+                )
+            return {
+                "request_id": request_id,
+                "session_id": session_id,
+                "answer": answer,
+                "execution_path": "text_chat",
+                "response_type": intent.value,
+                "status": "success",
+            }
+
+        # ── Step 3: Visual intents — plan visual spec ─────────────────────────
+        prev_spec_obj: Optional[VisualSpec] = None
+        if previous_visual_spec:
+            try:
+                from app.visual.planner import _dict_to_spec
+                prev_spec_obj = _dict_to_spec(previous_visual_spec)
+            except Exception:
+                pass
+
+        try:
+            spec, plan_errors = await asyncio.to_thread(
+                plan_visual_spec,
+                message,
+                intent,
+                _invoke,
+                None,
+                prev_spec_obj,
+            )
+        except Exception as exc:
+            logger.error("Visual planning raised exception", extra={"error": type(exc).__name__})
+            spec, plan_errors = None, [str(exc)]
+
+        if spec is None:
+            # Planning failed — fall back to written explanation
+            logger.warning("Visual planning failed; returning text fallback", extra={"errors": plan_errors})
+            try:
+                fallback_answer = await asyncio.to_thread(
+                    _invoke,
+                    message,
+                    _CHAT_SYSTEM_PROMPT,
+                    2048,
+                    0.3,
+                )
+            except Exception:
+                fallback_answer = (
+                    "I couldn't generate a visual for this request. "
+                    "Please try rephrasing or ask for a different format."
+                )
+            return {
+                "request_id": request_id,
+                "session_id": session_id,
+                "answer": fallback_answer,
+                "execution_path": "visual_fallback_text",
+                "response_type": "TEXT",
+                "status": "success",
+                "visual_generation_error": "planning_failed",
+            }
+
+        render_engine = spec.render_engine
+
+        # ── Step 4A: Structured diagram (Excalidraw) ──────────────────────────
+        if render_engine == RenderEngine.STRUCTURED:
+            # Build a lightweight node/edge JSON that the frontend Excalidraw component renders
+            structured_payload = self._spec_to_structured_diagram(spec)
+            explanation = await self._generate_explanation(spec, message, _invoke)
+
+            return {
+                "request_id": request_id,
+                "session_id": session_id,
+                "execution_path": "structured_diagram",
+                "response_type": "STRUCTURED_DIAGRAM",
+                "status": "success",
+                "answer": _json.dumps({
+                    "type": "visual_response",
+                    "title": spec.title,
+                    "introduction": explanation.get("introduction", ""),
+                    "sections": explanation.get("sections", []),
+                    "key_takeaway": explanation.get("key_takeaway", ""),
+                    "visual": {
+                        "kind": "structured_diagram",
+                        "spec": structured_payload,
+                        "alt": spec.alt_text,
+                    }
+                }),
+            }
+
+        # ── Step 4B: AI-generated image ───────────────────────────────────────
+        if render_engine == RenderEngine.IMAGE:
+            from app.visual.prompt_builder import build_image_prompt
+            from app.visual.image_generator import generate_and_store_image
+
+            image_prompt = build_image_prompt(spec)
+
+            meta = await generate_and_store_image(
+                image_prompt=image_prompt,
+                visual_id=visual_id,
+                request_id=request_id,
+                session_id=session_id,
+                tenant_id=tenant_id,
+                original_message=message,
+                title=spec.title,
+            )
+
+            explanation = await self._generate_explanation(spec, message, _invoke)
+
+            if meta.status.value == "ready":
+                visual_payload = {
+                    "kind": "generated_image",
+                    "visual_id": visual_id,
+                    "url": f"/api/visuals/{visual_id}",
+                    "mime_type": "image/png",
+                    "width": meta.width,
+                    "height": meta.height,
+                    "alt": spec.alt_text,
+                }
+                response_body = {
+                    "type": "visual_response",
+                    "title": spec.title,
+                    "introduction": explanation.get("introduction", ""),
+                    "sections": explanation.get("sections", []),
+                    "key_takeaway": explanation.get("key_takeaway", ""),
+                    "visual": visual_payload,
+                }
+                return {
+                    "request_id": request_id,
+                    "session_id": session_id,
+                    "execution_path": "generated_image",
+                    "response_type": intent.value,
+                    "status": "success",
+                    "visual_id": visual_id,
+                    "answer": _json.dumps(response_body),
+                }
+            else:
+                # Image generation failed — return explanation with error
+                error_body = {
+                    "type": "visual_response",
+                    "title": spec.title,
+                    "introduction": explanation.get("introduction", ""),
+                    "sections": explanation.get("sections", []),
+                    "key_takeaway": explanation.get("key_takeaway", ""),
+                    "visual": None,
+                    "visual_error": {
+                        "error_code": meta.error_code,
+                        "message": "The architecture visual could not be generated. The written explanation is still available.",
+                    }
+                }
+                return {
+                    "request_id": request_id,
+                    "session_id": session_id,
+                    "execution_path": "generated_image_failed",
+                    "response_type": intent.value,
+                    "status": "success",
+                    "answer": _json.dumps(error_body),
+                }
+
+        # ── Fallback: unknown engine → text ───────────────────────────────────
+        try:
+            answer = await asyncio.to_thread(_invoke, message, _CHAT_SYSTEM_PROMPT, 2048, 0.3)
+        except Exception:
+            answer = "Unable to process this request. Please try again."
         return {
             "request_id": request_id,
             "session_id": session_id,
             "answer": answer,
-            "execution_path": "ai_rca_chat",
-            "provider": settings.AI_PROVIDER,
-            "model": settings.BEDROCK_MODEL_ID,
+            "execution_path": "fallback_text",
+            "response_type": "TEXT",
             "status": "success",
         }
+
+    def _chat_error_response(
+        self, request_id: str, session_id: Optional[str], error_payload: Dict[str, Any]
+    ) -> Dict[str, Any]:
+        return {
+            "request_id": request_id,
+            "session_id": session_id,
+            "answer": None,
+            "execution_path": "ai_rca_chat",
+            "status": "error",
+            **error_payload,
+        }
+
+    def _spec_to_structured_diagram(self, spec) -> Dict[str, Any]:
+        """Convert VisualSpec to the JSON format expected by StructuredDiagramCard."""
+        nodes = []
+        groups = []
+        for section in spec.sections:
+            groups.append({"id": section.id, "label": section.label})
+            for comp in section.components:
+                nodes.append({
+                    "id": comp.id,
+                    "label": comp.label,
+                    "groupId": section.id,
+                    "type": comp.type,
+                    "description": comp.description or "",
+                })
+        edges = []
+        for i, rel in enumerate(spec.relationships):
+            edges.append({
+                "id": f"edge-{i}",
+                "source": rel.source,
+                "target": rel.target,
+                "label": rel.label or "",
+                "direction": rel.direction,
+            })
+        return {
+            "title": spec.title,
+            "direction": "LR" if spec.orientation == "landscape" else "TB",
+            "groups": groups,
+            "nodes": nodes,
+            "edges": edges,
+        }
+
+    async def _generate_explanation(
+        self, spec, message: str, invoke_fn
+    ) -> Dict[str, Any]:
+        """Generate the matching written explanation for a visual spec."""
+        import json as _json
+        import re as _re
+
+        spec_summary = {
+            "title": spec.title,
+            "purpose": spec.purpose,
+            "sections": [
+                {
+                    "label": s.label,
+                    "components": [{"label": c.label, "id": c.id, "type": c.type} for c in s.components]
+                }
+                for s in spec.sections
+            ],
+            "relationships": [
+                {"source": r.source, "target": r.target, "label": r.label}
+                for r in spec.relationships[:15]  # cap for prompt length
+            ],
+        }
+
+        explanation_prompt = (
+            f"User question: {message}\n\n"
+            f"VisualSpec:\n{_json.dumps(spec_summary, indent=2)}"
+        )
+
+        try:
+            raw = await asyncio.to_thread(
+                invoke_fn,
+                explanation_prompt,
+                _EXPLANATION_SYSTEM_PROMPT,
+                1500,
+                0.3,
+            )
+            match = _re.search(r'\{.*\}', raw, _re.DOTALL)
+            if match:
+                return _json.loads(match.group())
+        except Exception as exc:
+            logger.warning(f"Explanation generation failed: {exc}")
+
+        # Fallback: build simple explanation from spec
+        intro = f"This visual shows the {spec.title} architecture."
+        sections = [
+            {"heading": s.label, "content": f"Contains: {', '.join(c.label for c in s.components)}.", "component_ids": [c.id for c in s.components]}
+            for s in spec.sections
+        ]
+        return {"introduction": intro, "sections": sections, "key_takeaway": spec.key_takeaway or ""}
+
+
 
     # ── Private helpers ───────────────────────────────────────────────────────
 

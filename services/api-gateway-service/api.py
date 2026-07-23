@@ -443,6 +443,52 @@ async def chat_endpoint(request: ChatRequest, current_user: dict = Depends(get_c
     return ChatResponse(answer=answer, session_id=session_id)
 
 
+# ── Visual Asset Serving ───────────────────────────────────────────────────────
+
+_VISUALS_DIR = os.getenv("VISUAL_STORAGE_DIR", "/app/data/visuals")
+
+@app.get("/api/visuals/{visual_id}")
+async def serve_visual(visual_id: str, current_user: dict = Depends(get_current_user)):
+    """
+    Serve a generated visual image by ID.
+
+    Security:
+    - Requires valid JWT authentication.
+    - visual_id is sanitized to alphanumeric + hyphens only (prevents path traversal).
+    - File path is resolved and verified to remain inside VISUALS_DIR.
+    - MIME type is set by the server, not the client.
+    - Storage paths are never exposed in responses.
+    """
+    from fastapi.responses import FileResponse
+
+    # Sanitize visual_id — only allow alphanumeric + hyphens
+    safe_id = "".join(c for c in visual_id if c.isalnum() or c == "-")
+    if safe_id != visual_id or not safe_id:
+        raise HTTPException(status_code=400, detail="Invalid visual ID.")
+
+    file_path = os.path.join(_VISUALS_DIR, f"{safe_id}.png")
+
+    # Verify the resolved path stays within VISUALS_DIR (prevent traversal)
+    try:
+        real_visuals = os.path.realpath(_VISUALS_DIR)
+        real_file = os.path.realpath(file_path)
+        if not real_file.startswith(real_visuals):
+            raise HTTPException(status_code=400, detail="Invalid visual ID.")
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid visual ID.")
+
+    if not os.path.isfile(file_path):
+        raise HTTPException(status_code=404, detail="Visual not found.")
+
+    return FileResponse(
+        path=file_path,
+        media_type="image/png",
+        headers={"Cache-Control": "private, max-age=3600"},
+    )
+
+
+
+
 @app.post("/api/v1/rca/investigate")
 async def investigate_endpoint(request: Request, current_user: dict = Depends(get_current_user)):
     """
