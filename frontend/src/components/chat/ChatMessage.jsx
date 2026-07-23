@@ -188,6 +188,31 @@ graph LR
     end
 \`\`\`\n\n`;
       processed = cicdDiagram + processed;
+    } else if (/kubernetes|k8s|master_node|master node|etcd|kubelet|api server|control plane/i.test(processed)) {
+      const k8sDiagram = `\`\`\`mermaid
+graph TD
+    subgraph Master_Control_Plane["☸️ Kubernetes Control Plane (Master Node)"]
+        APIServer["⚡ API Server (kube-apiserver)"]
+        ETCD["🗄️ etcd (State Store)"]
+        Controller["⚙️ Controller Manager"]
+        Scheduler["📅 Kube-Scheduler"]
+
+        APIServer <--> ETCD
+        APIServer <--> Controller
+        APIServer <--> Scheduler
+    end
+
+    subgraph Worker_Nodes["🖥️ Worker Nodes (Compute Cluster)"]
+        Kubelet["🔌 Kubelet Agent"]
+        Proxy["🌐 Kube-Proxy Network"]
+        Pods["📦 Container Pods"]
+
+        Kubelet --> APIServer
+        Proxy --> APIServer
+        Kubelet --> Pods
+    end
+\`\`\`\n\n`;
+      processed = k8sDiagram + processed;
     } else if (/VNet 1|VNet 2|VNet 3|VNet peering|Virtual Network/i.test(processed)) {
       const vnetDiagram = `\`\`\`mermaid
 graph LR

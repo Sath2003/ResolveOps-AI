@@ -53,7 +53,7 @@ export default function ChatComposer({
 
   return (
     <div className="shrink-0 px-4 sm:px-6 py-4 border-t border-white/5 bg-[#080812]/80 backdrop-blur-md">
-      <div className="max-w-4xl mx-auto space-y-2">
+      <div className="max-w-7xl w-full mx-auto space-y-2">
         {imageFile && (
           <div className="relative w-14 h-14 border border-indigo-500/50 rounded-xl overflow-hidden group bg-slate-900 flex items-center justify-center">
             <img src={imageFile} alt="Preview" className="object-cover w-full h-full" />

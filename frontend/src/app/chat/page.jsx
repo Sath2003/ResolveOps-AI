@@ -305,7 +305,7 @@ export default function AICopilot() {
               onSelectPrompt={(prompt) => handleSend(prompt)}
             />
           ) : (
-            <div className="max-w-4xl mx-auto space-y-6">
+            <div className="max-w-7xl w-full mx-auto space-y-6">
               {messages.map((msg, i) => (
                 <MessageBubble
                   key={i}
