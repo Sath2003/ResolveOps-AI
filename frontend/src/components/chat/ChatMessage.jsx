@@ -12,7 +12,7 @@ mermaid.initialize({
   theme: "dark",
   flowchart: {
     useMaxWidth: false,
-    htmlLabels: true,
+    htmlLabels: false,
     curve: "basis"
   },
   themeVariables: {
@@ -59,6 +59,67 @@ function injectSVGStyles(rawSvg) {
       margin: 0 auto !important;
       background: transparent !important;
     }
+
+    /* Node Cards Fill & Border */
+    .mermaid-svg-container svg .node rect,
+    .mermaid-svg-container svg g.node rect,
+    .mermaid-svg-container svg .node polygon,
+    .mermaid-svg-container svg .node circle,
+    .mermaid-svg-container svg rect.label-container,
+    .mermaid-svg-container svg .label-container {
+      fill: #1e1b4b !important;
+      stroke: #6366f1 !important;
+      stroke-width: 2px !important;
+      opacity: 1 !important;
+      visibility: visible !important;
+    }
+
+    /* Subgraph Cluster Boundaries */
+    .mermaid-svg-container svg .cluster rect,
+    .mermaid-svg-container svg g.cluster rect,
+    .mermaid-svg-container svg g.cluster > rect {
+      fill: #0f172a !important;
+      fill-opacity: 0.8 !important;
+      stroke: #334155 !important;
+      stroke-width: 1.5px !important;
+      opacity: 1 !important;
+      visibility: visible !important;
+    }
+
+    /* Text Labels (Nodes, Edge Labels, Clusters) */
+    .mermaid-svg-container svg text,
+    .mermaid-svg-container svg tspan,
+    .mermaid-svg-container svg .nodeLabel,
+    .mermaid-svg-container svg .cluster-label,
+    .mermaid-svg-container svg .label text,
+    .mermaid-svg-container svg .edgeLabel text,
+    .mermaid-svg-container svg text.actor {
+      fill: #ffffff !important;
+      color: #ffffff !important;
+      font-family: ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif !important;
+      font-size: 13px !important;
+      font-weight: 600 !important;
+      opacity: 1 !important;
+      visibility: visible !important;
+    }
+
+    /* Connector Paths & Flowchart Links */
+    .mermaid-svg-container svg .edgePath path,
+    .mermaid-svg-container svg .flowchart-link,
+    .mermaid-svg-container svg path.path,
+    .mermaid-svg-container svg .link {
+      stroke: #818cf8 !important;
+      stroke-width: 2px !important;
+      opacity: 1 !important;
+      visibility: visible !important;
+    }
+
+    /* Edge Badges & Label Rectangles */
+    .mermaid-svg-container svg .edgeLabel rect {
+      fill: #090d16 !important;
+      stroke: #374151 !important;
+      opacity: 1 !important;
+    }
   </style>`;
 
   return svg.replace(/<svg[^>]*>/, (match) => `${match}${customStyle}`);
@@ -104,9 +165,9 @@ function formatAndSanitizeMermaidCode(code) {
   });
 
   // 5. Wrap unquoted node labels containing spaces or special characters in quotes
-  text = text.replace(/(\w+)\s*\[([^"\n\]]+)\]/g, (m, id, label) => {
-    if (label.startsWith('"') && label.endsWith('"')) return m;
-    return `${id}["${label}"]`;
+  text = text.replace(/^(\s*)(\w+)\s*\[\s*([^"\n\]]+?)\s*\]/gm, (match, indent, id, label) => {
+    if (label.startsWith('"') && label.endsWith('"')) return match;
+    return `${indent}${id}["${label}"]`;
   });
 
   return text;
@@ -127,13 +188,24 @@ function fitSVGToViewBox(rawSvg) {
 
     const svgElem = tempContainer.querySelector("svg");
     if (svgElem) {
-      // 1. Remove restrictive max-width / height attributes & inline style
+      // 1. Log SVG DOM Element Counts for Diagnosis
+      console.log("[Mermaid SVG DOM Inspection]", {
+        nodeGroups: svgElem.querySelectorAll("g.node, .node").length,
+        rectangles: svgElem.querySelectorAll("rect").length,
+        polygons: svgElem.querySelectorAll("polygon").length,
+        textElements: svgElem.querySelectorAll("text, tspan").length,
+        foreignObjects: svgElem.querySelectorAll("foreignObject").length,
+        styleElements: svgElem.querySelectorAll("style").length,
+        edgePaths: svgElem.querySelectorAll(".edgePath path, .flowchart-link, path").length,
+      });
+
+      // 2. Remove restrictive max-width / height attributes & inline style
       svgElem.removeAttribute("style");
       svgElem.setAttribute("style", "width: 100%; height: auto; display: block; margin: 0 auto;");
       svgElem.setAttribute("width", "100%");
       svgElem.removeAttribute("height");
 
-      // 2. Query root group & calculate actual BBox
+      // 3. Query root group & calculate actual BBox
       const rootGroup = svgElem.querySelector("g");
       if (rootGroup && typeof rootGroup.getBBox === "function") {
         const bbox = rootGroup.getBBox();
