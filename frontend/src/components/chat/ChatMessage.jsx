@@ -50,26 +50,26 @@ function injectSVGStyles(rawSvg) {
   });
 
   const customStyle = `<style>
-    svg { max-width: 100% !important; width: 100% !important; height: auto !important; min-height: 260px !important; display: block !important; margin: 0 auto !important; background: transparent !important; }
+    .mermaid-svg-container svg { max-width: 100% !important; width: 100% !important; height: auto !important; min-height: 260px !important; display: block !important; margin: 0 auto !important; background: transparent !important; }
     
-    g.cluster > rect, .cluster > rect, g.cluster rect {
+    .mermaid-svg-container g.cluster > rect, .mermaid-svg-container .cluster > rect, .mermaid-svg-container g.cluster rect {
       fill: #0f172a !important;
       stroke: #334155 !important;
       stroke-width: 1.5px !important;
     }
 
-    g.cluster > rect.inner, .cluster rect.inner, rect.inner, g.cluster .inner {
+    .mermaid-svg-container g.cluster > rect.inner, .mermaid-svg-container .cluster rect.inner, .mermaid-svg-container rect.inner, .mermaid-svg-container g.cluster .inner {
       fill: transparent !important;
       stroke: none !important;
     }
 
-    g.node rect, g.node circle, g.node polygon, g.node path, .node rect, .node circle, .node polygon, .node path {
+    .mermaid-svg-container g.node rect, .mermaid-svg-container g.node circle, .mermaid-svg-container g.node polygon, .mermaid-svg-container g.node path, .mermaid-svg-container .node rect, .mermaid-svg-container .node circle, .mermaid-svg-container .node polygon, .mermaid-svg-container .node path {
       fill: #1e1b4b !important;
       stroke: #6366f1 !important;
       stroke-width: 2px !important;
     }
 
-    foreignObject, foreignObject *, .nodeLabel, .cluster-label, text, tspan, span, p {
+    .mermaid-svg-container foreignObject, .mermaid-svg-container foreignObject *, .mermaid-svg-container .nodeLabel, .mermaid-svg-container .cluster-label, .mermaid-svg-container text, .mermaid-svg-container tspan, .mermaid-svg-container span, .mermaid-svg-container p {
       fill: #ffffff !important;
       color: #ffffff !important;
       font-family: ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif !important;
@@ -79,17 +79,17 @@ function injectSVGStyles(rawSvg) {
       visibility: visible !important;
     }
 
-    .edgePath path, .flowchart-link {
+    .mermaid-svg-container .edgePath path, .mermaid-svg-container .flowchart-link {
       stroke: #818cf8 !important;
       stroke-width: 2px !important;
     }
 
-    .edgeLabel rect {
+    .mermaid-svg-container .edgeLabel rect {
       fill: #090d16 !important;
       stroke: #374151 !important;
     }
 
-    .edgeLabel text, .edgeLabel span, .edgeLabel div {
+    .mermaid-svg-container .edgeLabel text, .mermaid-svg-container .edgeLabel span, .mermaid-svg-container .edgeLabel div {
       fill: #a5b4fc !important;
       color: #a5b4fc !important;
       font-size: 11px !important;
