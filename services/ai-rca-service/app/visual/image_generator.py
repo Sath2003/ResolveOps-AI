@@ -187,8 +187,11 @@ async def generate_and_store_image(
             },
         )
 
-        with open(file_path, "wb") as f:
-            f.write(response)
+        try:
+            with open(file_path, "wb") as f:
+                f.write(response)
+        except Exception as exc:
+            raise ValueError(f"IMAGE_STORAGE_FAILED: Could not write image file to disk: {exc}") from exc
 
         elapsed = round(time.monotonic() - start_time, 2)
         logger.info(
@@ -254,8 +257,11 @@ def _call_dalle(
     size: str,
     request_id: str = "",
     visual_id: str = "",
-) -> Optional[bytes]:
-    """Synchronous DALL-E call (run in thread). Returns raw PNG bytes or None."""
+) -> bytes:
+    """
+    Synchronous OpenAI image generation call (runs in thread).
+    Handles both GPT Image models (gpt-image-2, etc.) and legacy DALL-E models (dall-e-3, dall-e-2).
+    """
     logger.info(
         "visual_generation_stage",
         extra={
@@ -266,39 +272,93 @@ def _call_dalle(
             "model": model,
         },
     )
-    response = client.images.generate(
-        model=model,
-        prompt=prompt,
-        size=size,
-        quality=quality,
-        response_format="b64_json",
-        n=1,
-    )
-    if response.data:
-        b64_data = response.data[0].b64_json
-        if b64_data:
-            return base64.b64decode(b64_data)
-    return None
+
+    is_gpt_image = "gpt-image" in model.lower()
+
+    params = {
+        "model": model,
+        "prompt": prompt,
+        "size": size,
+        "n": 1,
+    }
+
+    if is_gpt_image:
+        # GPT Image models do NOT support response_format, style, quality="hd"/"standard".
+        # Map OPENAI_IMAGE_FORMAT to output_format
+        params["output_format"] = settings.OPENAI_IMAGE_FORMAT
+        # Include quality if using gpt-image supported value (e.g. medium)
+        if quality in ["low", "medium", "high"]:
+            params["quality"] = quality
+    else:
+        # DALL-E models
+        params["response_format"] = "b64_json"
+        if quality in ["standard", "hd"]:
+            params["quality"] = quality
+
+    try:
+        response = client.images.generate(**params)
+    except Exception as exc:
+        code = _classify_openai_error(exc)
+        logger.error(
+            "visual_generation_stage",
+            extra={
+                "request_id": request_id,
+                "visual_id": visual_id,
+                "stage": "image_provider_request",
+                "status": "failed",
+                "typed_error": code,
+                "error_detail": str(exc),
+            },
+        )
+        raise RuntimeError(f"{code}: {exc}") from exc
+
+    if not response or not hasattr(response, "data") or not response.data:
+        raise ValueError("OPENAI_EMPTY_RESPONSE: OpenAI Image API returned empty data list")
+
+    first_item = response.data[0]
+    b64_data = getattr(first_item, "b64_json", None)
+
+    if not b64_data:
+        # Check if URL was returned instead or data item is missing b64_json
+        url = getattr(first_item, "url", None)
+        if url:
+            import requests
+            img_res = requests.get(url, timeout=30)
+            if img_res.status_code == 200 and img_res.content:
+                return img_res.content
+        raise ValueError("OPENAI_EMPTY_RESPONSE: Response missing b64_json field")
+
+    try:
+        image_bytes = base64.b64decode(b64_data, validate=True)
+    except Exception as exc:
+        raise ValueError(f"IMAGE_DECODE_FAILED: Base64 decoding failed: {exc}") from exc
+
+    if not image_bytes or len(image_bytes) == 0:
+        raise ValueError("IMAGE_DECODE_FAILED: Decoded image byte size is 0")
+
+    return image_bytes
 
 
 def _classify_openai_error(exc: Exception) -> str:
-    """Map OpenAI exceptions to safe error codes without exposing raw messages."""
+    """Map OpenAI exceptions to typed error codes."""
     exc_str = type(exc).__name__.lower()
     exc_msg = str(exc).lower()
 
-    if "content_policy" in exc_msg or "safety" in exc_msg or "violated" in exc_msg:
-        return "content_policy_rejection"
-    if "rate_limit" in exc_msg or "ratelimit" in exc_str:
-        return "rate_limit_exceeded"
-    if "quota" in exc_msg or "billing" in exc_msg:
-        return "quota_exceeded"
+    if "authentication" in exc_msg or "invalid_api_key" in exc_msg or "401" in exc_msg:
+        return "OPENAI_AUTHENTICATION_FAILED"
+    if "rate_limit" in exc_msg or "ratelimit" in exc_str or "429" in exc_msg:
+        return "OPENAI_RATE_LIMITED"
     if "timeout" in exc_str or "timeout" in exc_msg:
-        return "provider_timeout"
-    if "authentication" in exc_msg or "invalid_api_key" in exc_msg:
-        return "invalid_api_key"
+        return "OPENAI_TIMEOUT"
+    if "param" in exc_msg or "unknown parameter" in exc_msg or "badrequest" in exc_str or "400" in exc_msg:
+        return "OPENAI_INVALID_PARAMETERS"
+    if "content_policy" in exc_msg or "safety" in exc_msg or "violated" in exc_msg:
+        return "OPENAI_CONTENT_POLICY_VIOLATION"
+    if "quota" in exc_msg or "billing" in exc_msg:
+        return "OPENAI_QUOTA_EXCEEDED"
     if "connection" in exc_str:
-        return "provider_connection_error"
-    return "image_generation_failed"
+        return "OPENAI_CONNECTION_ERROR"
+    return "OPENAI_IMAGE_GENERATION_FAILED"
 
 
 def get_stored_image_path(visual_id: str) -> Optional[str]:

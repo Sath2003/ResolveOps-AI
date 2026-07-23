@@ -322,5 +322,70 @@ class TestVisualSpec:
         assert "Kubelet" in labels
 
 
+# ── GPT Image Model parameter & decoding tests ─────────────────────────────────
+
+class TestGPTImageGenerator:
+    def test_call_dalle_gpt_image_parameters(self, monkeypatch):
+        from app.visual.image_generator import _call_dalle
+        import base64
+
+        recorded_params = {}
+
+        class DummyData:
+            b64_json = base64.b64encode(b"fake_png_data").decode("utf-8")
+
+        class DummyResponse:
+            data = [DummyData()]
+
+        class DummyImages:
+            def generate(self, **kwargs):
+                recorded_params.update(kwargs)
+                return DummyResponse()
+
+        class DummyClient:
+            images = DummyImages()
+
+        res_bytes = _call_dalle(
+            client=DummyClient(),
+            prompt="Test prompt",
+            model="gpt-image-2",
+            quality="medium",
+            size="1536x1024",
+            request_id="req-1",
+            visual_id="vis-1",
+        )
+
+        assert res_bytes == b"fake_png_data"
+        assert recorded_params["model"] == "gpt-image-2"
+        assert recorded_params["output_format"] == "png"
+        assert recorded_params["quality"] == "medium"
+        assert "response_format" not in recorded_params
+        assert "style" not in recorded_params
+
+    def test_call_dalle_empty_data_raises(self):
+        from app.visual.image_generator import _call_dalle
+        import pytest
+
+        class DummyResponse:
+            data = []
+
+        class DummyImages:
+            def generate(self, **kwargs):
+                return DummyResponse()
+
+        class DummyClient:
+            images = DummyImages()
+
+        with pytest.raises(RuntimeError) as exc_info:
+            _call_dalle(
+                client=DummyClient(),
+                prompt="Test prompt",
+                model="gpt-image-2",
+                quality="medium",
+                size="1536x1024",
+            )
+        assert "OPENAI_EMPTY_RESPONSE" in str(exc_info.value)
+
+
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])

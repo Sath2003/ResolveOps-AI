@@ -80,12 +80,12 @@ class Settings:
     VISUAL_GENERATION_ENABLED: bool = (
         os.getenv("VISUAL_GENERATION_ENABLED", "true").lower() == "true"
     )
-    # DALL-E 3 supports: dall-e-3, dall-e-2
-    OPENAI_IMAGE_MODEL: str = os.getenv("OPENAI_IMAGE_MODEL", "dall-e-3")
-    # DALL-E 3 quality: hd | standard
-    OPENAI_IMAGE_QUALITY: str = os.getenv("OPENAI_IMAGE_QUALITY", "hd")
-    # DALL-E 3 landscape: 1792x1024, portrait: 1024x1792, square: 1024x1024
-    OPENAI_IMAGE_SIZE: str = os.getenv("OPENAI_IMAGE_SIZE", "1792x1024")
+    # DALL-E 3 / GPT Image models: gpt-image-2, dall-e-3, dall-e-2
+    OPENAI_IMAGE_MODEL: str = os.getenv("OPENAI_IMAGE_MODEL", "gpt-image-2")
+    # GPT Image quality: medium | hd | standard
+    OPENAI_IMAGE_QUALITY: str = os.getenv("OPENAI_IMAGE_QUALITY", "medium")
+    # GPT Image landscape: 1536x1024, portrait: 1024x1536, square: 1024x1024
+    OPENAI_IMAGE_SIZE: str = os.getenv("OPENAI_IMAGE_SIZE", "1536x1024")
     OPENAI_IMAGE_FORMAT: str = os.getenv("OPENAI_IMAGE_FORMAT", "png")
     VISUAL_STORAGE_PROVIDER: str = os.getenv("VISUAL_STORAGE_PROVIDER", "local")
     VISUAL_STORAGE_DIR: str = os.getenv("VISUAL_STORAGE_DIR", "/app/data/visuals")
