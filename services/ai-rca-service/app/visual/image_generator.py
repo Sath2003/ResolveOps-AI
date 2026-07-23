@@ -273,7 +273,7 @@ def _call_dalle(
         },
     )
 
-    is_gpt_image = "gpt-image" in model.lower()
+    is_gpt_image = "gpt" in model.lower() or "image" in model.lower() and not "dall-e" in model.lower()
 
     params = {
         "model": model,
@@ -283,17 +283,19 @@ def _call_dalle(
     }
 
     if is_gpt_image:
-        # GPT Image models do NOT support response_format, style, quality="hd"/"standard".
-        # Map OPENAI_IMAGE_FORMAT to output_format
         params["output_format"] = settings.OPENAI_IMAGE_FORMAT
-        # Include quality if using gpt-image supported value (e.g. medium)
         if quality in ["low", "medium", "high"]:
             params["quality"] = quality
     else:
-        # DALL-E models
-        params["response_format"] = "b64_json"
+        # For legacy models, only include response_format if not explicitly model-restricted
+        if "dall-e" in model.lower():
+            params["response_format"] = "b64_json"
         if quality in ["standard", "hd"]:
             params["quality"] = quality
+
+    # GUARANTEE: Never send response_format if model is not dall-e
+    if "dall-e" not in model.lower():
+        params.pop("response_format", None)
 
     try:
         response = client.images.generate(**params)
