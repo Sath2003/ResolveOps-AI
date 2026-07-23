@@ -31,8 +31,14 @@ function MermaidDiagram({ code }) {
         .replace(/-->\|([^|]+)\|>/g, "-->|$1|")
         .replace(/->\|([^|]+)\|>/g, "-->|$1|")
         .replace(/-->\|([^|]+)\| >/g, "-->|$1|")
+        .replace(/<-->\|([^|]+)\|/g, "-->|$1|")
         .replace(/style\s+\w+\s+fill:[^;\n]+;\s*/gi, "")
         .replace(/style\s+\w+\s+fill:[^;\n]+$/gi, "");
+
+      // Ensure graph header
+      if (!/^(graph|flowchart|sequenceDiagram|classDiagram|gantt|erDiagram)/i.test(cleanedCode.trim())) {
+        cleanedCode = "graph LR\n" + cleanedCode;
+      }
 
       // Auto-assign IDs for standalone quoted nodes: "Label" --> ... => N1["Label"] --> ...
       cleanedCode = cleanedCode.replace(/(?<=^|\s|-->|->)("[^"\n]+")(?=\s|-->|->|$)/gm, (match) => {
@@ -42,6 +48,12 @@ function MermaidDiagram({ code }) {
           labelToId.set(text, `N${nodeIdx}[${text}]`);
         }
         return labelToId.get(text);
+      });
+
+      // Wrap unquoted labels containing brackets/parens/slashes in quotes: ID[Label (parens)] => ID["Label (parens)"]
+      cleanedCode = cleanedCode.replace(/(\w+)\s*\[([^"\n\]]+)\]/g, (m, id, label) => {
+        if (label.startsWith('"') && label.endsWith('"')) return m;
+        return `${id}["${label}"]`;
       });
 
       const id = `mermaid-${Math.random().toString(36).substring(2, 9)}`;
@@ -79,6 +91,55 @@ function MermaidDiagram({ code }) {
   return <div ref={containerRef} className="my-3 p-4 bg-[#030712] border border-white/10 rounded-xl overflow-x-auto flex justify-center shadow-lg" />;
 }
 
+function preprocessMarkdownContent(content) {
+  if (!content) return "";
+  let processed = content;
+
+  // 1. Fix code blocks like ``` \n graph TD ... ``` that missed the 'mermaid' language identifier
+  processed = processed.replace(/```\s*\n(graph\s+(?:TD|LR|TB|RL)|flowchart\s+(?:TD|LR|TB|RL)|sequenceDiagram|classDiagram|erDiagram|gantt)/gi, '```mermaid\n$1');
+
+  // 2. Auto-wrap unfenced graph/flowchart code blocks
+  if (!processed.includes("```mermaid")) {
+    const unfencedRegex = /((?:graph\s+(?:TD|LR|TB|RL)|flowchart\s+(?:TD|LR|TB|RL)|sequenceDiagram)[\s\S]+?)(?=\n\n[A-Z]|\n\n#|\n\nIn this|$)/i;
+    if (unfencedRegex.test(processed)) {
+      processed = processed.replace(unfencedRegex, "```mermaid\n$1\n```");
+    }
+  }
+
+  // 3. Auto-fallback for text mentioning VNets / architecture when NO ```mermaid block exists!
+  if (!processed.includes("```mermaid")) {
+    const isVNetQuery = /VNet 1|VNet 2|VNet 3|VNet peering|Virtual Network/i.test(processed);
+    if (isVNetQuery) {
+      const vnetDiagram = `\`\`\`mermaid
+graph LR
+    subgraph Azure_Network["☁️ Azure Region (Virtual Networks)"]
+        direction LR
+        subgraph VNet1_Box["🌐 VNet 1"]
+            VNet1["VNet 1 (Hub / Origin)"]
+        end
+        subgraph VNet2_Box["🌐 VNet 2"]
+            VNet2["VNet 2 (Transit Gateway / Router)"]
+        end
+        subgraph VNet3_Box["🌐 VNet 3"]
+            VNet3["VNet 3 (Spoke Target)"]
+        end
+    end
+
+    VNet1 -->|Direct VNet Peering| VNet2
+    VNet2 -->|Direct VNet Peering| VNet3
+    VNet1 -.->|Transitive Routing via VNet 2| VNet3
+
+    style VNet1_Box fill:#1e1b4b,stroke:#6366f1,stroke-width:2px
+    style VNet2_Box fill:#064e3b,stroke:#10b981,stroke-width:2px
+    style VNet3_Box fill:#1e1b4b,stroke:#6366f1,stroke-width:2px
+\`\`\`\n\n`;
+      processed = vnetDiagram + processed;
+    }
+  }
+
+  return processed;
+}
+
 function timeAgo(iso) {
   if (!iso) return "";
   const secs = Math.floor((Date.now() - new Date(iso)) / 1000);
@@ -91,6 +152,7 @@ function timeAgo(iso) {
 export function MessageBubble({ msg, onRetry }) {
   const isRCA = msg.rca_data && (msg.rca_data.investigation_id || msg.rca_data.probable_root_cause);
   const isError = msg.is_error;
+  const processedContent = preprocessMarkdownContent(msg.content);
 
   if (isError) {
     return (
@@ -136,7 +198,7 @@ export function MessageBubble({ msg, onRetry }) {
                   const language = match ? match[1] : "";
                   const codeString = String(children).replace(/\n$/, "");
 
-                  if (!inline && language === "mermaid") {
+                  if (!inline && (language === "mermaid" || codeString.trim().startsWith("graph ") || codeString.trim().startsWith("flowchart "))) {
                     return <MermaidDiagram code={codeString} />;
                   }
 
@@ -160,7 +222,7 @@ export function MessageBubble({ msg, onRetry }) {
                 p: ({ ...props }) => <p className="mb-2 last:mb-0" {...props} />,
               }}
             >
-              {msg.content}
+              {processedContent}
             </ReactMarkdown>
           </div>
         )}
