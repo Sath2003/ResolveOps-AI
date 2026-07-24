@@ -2856,15 +2856,18 @@ def github_status_proxy(current_user: dict = Depends(get_current_user)):
 @app.post("/api/v1/github/sync")
 async def github_sync_proxy(req: Request, current_user: dict = Depends(get_current_user)):
     import requests
-    pat = get_github_token_for_tenant(current_user.get("email"))
-    if not pat:
+    from database import get_user_integrations
+    integrations = get_user_integrations(current_user.get("email")) or {}
+    github_data = integrations.get("github", integrations.get("github_actions", {}))
+    github_token = github_data.get("credentials", {}).get("github_token", os.getenv("GITHUB_PAT"))
+    if not github_token:
         return JSONResponse(status_code=200, content={
             "connected": False,
             "status": "github_not_connected",
             "error_code": "github_pat_missing",
             "message": "Connect your GitHub PAT in Integrations to sync repositories and workflows."
         })
-    headers = {"X-GitHub-Token": pat}
+    headers = {"X-GitHub-Token": github_token}
     try:
         data = await req.json()
     except Exception:
