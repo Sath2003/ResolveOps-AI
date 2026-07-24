@@ -11,7 +11,7 @@ Provides a controlled interface for Bedrock invocations:
 import json
 import logging
 import uuid
-from typing import Optional
+from typing import Optional, List, Dict, Any
 
 import boto3
 from botocore.config import Config

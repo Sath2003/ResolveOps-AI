@@ -64,4 +64,4 @@ mcp.tool(name="incidents.get_recent_incidents")(resolveops_get_recent_incidents)
 mcp.tool(name="incidents.get_service_health")(resolveops_get_service_health)
 
 # Get ASGI application
-fastmcp_asgi_app = mcp.get_asgi_app()
+fastmcp_asgi_app = mcp.streamable_http_app()
