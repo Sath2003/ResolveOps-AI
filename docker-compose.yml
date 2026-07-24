@@ -29,6 +29,7 @@ services:
     environment:
       - NEXT_PUBLIC_API_BASE_URL=/api
     networks:
+      - default
       - frontend-net
     depends_on:
       - api-gateway-service
@@ -47,6 +48,7 @@ services:
       - ./data:/app/data
       - generated_visuals:/app/data/visuals
     networks:
+      - default
       - frontend-net
       - backend-net
     depends_on:
