@@ -223,7 +223,7 @@ def sync_github(req: SyncRequest, x_github_token: Optional[str] = Header(None)):
     # 3 & 4. Fetch Workflows and Runs per repo
     for repo in filtered_repos:
         repo_full_name = repo.get("full_name")
-        owner = repo.get("owner", {}).get("login")
+        owner = (repo.get("owner") or {}).get("login")
         repo_name = repo.get("name")
         
         # Fetch workflows
