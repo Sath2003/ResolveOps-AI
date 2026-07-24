@@ -6,7 +6,7 @@ import jwt
 from fastapi import Request, HTTPException, Security, Depends
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from typing import Optional, List, Dict, Any
-import requests
+import httpx
 
 logger = logging.getLogger(__name__)
 
@@ -32,7 +32,7 @@ def get_jwks_keys() -> List[Dict[str, Any]]:
     if _jwks_cache and now < _jwks_cache_expiry:
         return _jwks_cache.get("keys", [])
     try:
-        resp = requests.get(JWKS_URL, timeout=5)
+        resp = httpx.get(JWKS_URL, timeout=5)
         if resp.status_code == 200:
             _jwks_cache = resp.json()
             _jwks_cache_expiry = now + JWKS_CACHE_TTL
