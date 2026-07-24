@@ -223,6 +223,7 @@ class InvestigationOrchestrator:
         message: str,
         session_id: Optional[str] = None,
         tenant_id: Optional[str] = None,
+        tenant_email: Optional[str] = None,
         previous_visual_spec: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
         """
