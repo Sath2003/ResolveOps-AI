@@ -54,24 +54,6 @@ app = FastAPI(
 def health_check():
     return {"status": "ok"}
 
-@app.post("/api/v1/debug/reset-db")
-def reset_database():
-    from pg_database import SessionLocal
-    from sqlalchemy import text
-    if not SessionLocal:
-        return {"status": "error", "message": "PG DB not initialized"}
-    
-    db = SessionLocal()
-    try:
-        db.execute(text("TRUNCATE TABLE resolveops_users, nexus_chat_history, nexus_api_keys, artifacts CASCADE;"))
-        db.commit()
-        return {"status": "success", "message": "Database reset completed. All users and chat histories deleted."}
-    except Exception as e:
-        db.rollback()
-        return {"status": "error", "message": str(e)}
-    finally:
-        db.close()
-
 # ── Feature flags (resolved once at startup) ─────────────────────────────────
 _AI_RCA_CHAT_ENABLED: bool = os.getenv("AI_RCA_CHAT_ENABLED", "true").lower() == "true"
 _MCP_RCA_ENABLED: bool = os.getenv("MCP_RCA_ENABLED", "true").lower() == "true"
