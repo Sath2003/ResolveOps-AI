@@ -2988,19 +2988,32 @@ async def get_analytics_overview(current_user: dict = Depends(get_current_user))
     github_connected = bool(integrations.get("github", {}).get("connected") or os.getenv("GITHUB_PAT"))
 
     # 2. Query Incident Counts from DB
-    incidents_table = get_incidents_table()
-    inc_query = incidents_table.query(
-        IndexName='TenantIdIndex',
-        KeyConditionExpression=Key('tenant_id').eq(tenant_id)
-    ) if hasattr(incidents_table, 'query') else {'Items': []}
-    all_incidents = inc_query.get('Items', [])
-    active_incidents = [i for i in all_incidents if i.get("status") in ("active", "investigating", "open")]
-    critical_incidents = [i for i in all_incidents if i.get("severity") in ("CRITICAL", "critical", "HIGH", "high")]
+    from pg_database import SessionLocal, Incident, Log
+    db = SessionLocal()
+    try:
+        all_incidents_orm = db.query(Incident).filter_by(tenant_id=tenant_id).all()
+        all_incidents = [
+            {
+                "status": i.status,
+                "severity": i.severity
+            } for i in all_incidents_orm
+        ]
+        
+        active_incidents = [i for i in all_incidents if i.get("status") in ("active", "investigating", "open")]
+        critical_incidents = [i for i in all_incidents if i.get("severity") in ("CRITICAL", "critical", "HIGH", "high")]
 
-    # 3. Query Service Health from logs
-    logs_table = get_logs_table()
-    log_query = logs_table.query(Limit=100) if hasattr(logs_table, 'query') else {'Items': []}
-    logs = log_query.get('Items', [])
+        # 3. Query Service Health from logs
+        logs_orm = db.query(Log).order_by(Log.timestamp.desc()).limit(100).all()
+        logs = [
+            {
+                "service": l.service,
+                "resource_id": l.resource_id,
+                "level": l.level
+            } for l in logs_orm
+        ]
+    finally:
+        db.close()
+
     services = {}
     for l in logs:
         srv = l.get("service") or l.get("resource_id") or "api-gateway-service"

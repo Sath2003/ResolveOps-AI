@@ -90,7 +90,7 @@ class Deployment(Base):
     pr_url = Column(String(1024), nullable=True)
 
 class ChatHistory(Base):
-    __tablename__ = 'nexus_chat_history'
+    __tablename__ = 'resolveops_chat_history'
     id = Column(String(36), primary_key=True, default=lambda: str(uuid.uuid4()))
     tenant_id = Column(String(255), nullable=False, index=True)
     timestamp = Column(String(100), nullable=False)
