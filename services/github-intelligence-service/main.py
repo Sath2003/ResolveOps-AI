@@ -91,7 +91,7 @@ def normalize_repo(repo: dict) -> dict:
         "id": str(repo.get("id", "")),
         "name": repo.get("name", ""),
         "full_name": repo.get("full_name", ""),
-        "owner": repo.get("owner", {}).get("login", ""),
+        "owner": (repo.get("owner") or {}).get("login", ""),
         "private": repo.get("private", False),
         "html_url": repo.get("html_url", ""),
         "default_branch": repo.get("default_branch", "main"),
@@ -198,7 +198,7 @@ def sync_github(req: SyncRequest, x_github_token: Optional[str] = Header(None)):
     filtered_repos = raw_repos
     excluded_count = 0
     if req.scope in ["owned", "public_owned"]:
-        filtered_repos = [r for r in raw_repos if r.get("owner", {}).get("login", "").lower() == username.lower()]
+        filtered_repos = [r for r in raw_repos if (r.get("owner") or {}).get("login", "").lower() == (username or "").lower()]
         if req.scope == "public_owned":
             filtered_repos = [r for r in filtered_repos if not r.get("private", True)]
         excluded_count = len(raw_repos) - len(filtered_repos)
