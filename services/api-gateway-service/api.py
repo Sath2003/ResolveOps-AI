@@ -59,7 +59,7 @@ _AI_RCA_CHAT_ENABLED: bool = os.getenv("AI_RCA_CHAT_ENABLED", "true").lower() ==
 _MCP_RCA_ENABLED: bool = os.getenv("MCP_RCA_ENABLED", "true").lower() == "true"
 _LEGACY_GATEWAY_RAG_ENABLED: bool = os.getenv("LEGACY_GATEWAY_RAG_ENABLED", "false").lower() == "true"
 _AI_RCA_SERVICE_URL: str = os.getenv("AI_RCA_SERVICE_URL", "http://ai-rca-service:8000")
-
+GITHUB_INTELLIGENCE_SERVICE_URL: str = os.getenv("GITHUB_INTELLIGENCE_SERVICE_URL", "http://github-intelligence-service:8000")
 # Legacy RAG engine — only initialised when the feature flag requires it.
 # When AI_RCA_CHAT_ENABLED=true this is never called for chat.
 if _LEGACY_GATEWAY_RAG_ENABLED:
