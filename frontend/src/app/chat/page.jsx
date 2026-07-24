@@ -65,6 +65,11 @@ export default function AICopilot() {
     try {
       const history = await fetchApi(`/api/chat/history?session_id=${sid}`);
       if (Array.isArray(history) && history.length > 0) {
+        const safeParse = (val) => {
+          if (!val) return null;
+          if (typeof val === "object") return val;
+          try { return JSON.parse(val); } catch { return null; }
+        };
         setMessages(
           history.map((msg) => ({
             role: msg.role || "assistant",
@@ -73,6 +78,8 @@ export default function AICopilot() {
                 ? `🖼️ [Uploaded Architecture Diagram] ${msg.content || ""}`
                 : msg.content || "",
             timestamp: msg.timestamp,
+            execution: safeParse(msg.execution),
+            rca_data: safeParse(msg.rca_data) || (msg.role === "assistant" && msg.content?.trim().startsWith("{") ? safeParse(msg.content) : null),
           }))
         );
         if (history[0]?.title) {
@@ -230,6 +237,7 @@ export default function AICopilot() {
           role: "assistant",
           content: data.answer || "",
           rca_data: rcaData,
+          execution: data.execution,
           timestamp: new Date().toISOString(),
         },
       ]);

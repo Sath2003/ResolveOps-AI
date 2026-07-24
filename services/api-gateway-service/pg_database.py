@@ -99,6 +99,7 @@ class ChatHistory(Base):
     content = Column(Text)
     image_base64 = Column(Text, nullable=True)
     title = Column(String(255), nullable=True)
+    execution = Column(JSON, nullable=True)
 
 class PredictiveRisk(Base):
     __tablename__ = 'nexus_predictive_risks'

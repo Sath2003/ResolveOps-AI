@@ -28,6 +28,7 @@ from database import (
 import notifications
 from predictive_engine import PredictiveEngine
 from pg_database import init_pg_db, get_db, Artifact
+from mcp_security import verify_mcp_service
 from storage import init_storage, upload_artifact_blob, download_artifact_blob
 
 # Initialize Predictive Engine
@@ -101,6 +102,7 @@ class ChatRequest(BaseModel):
 class ChatResponse(BaseModel):
     answer: str
     session_id: str
+    execution: Optional[dict] = None
 
 class ApiKeyResponse(BaseModel):
     key: str
@@ -357,10 +359,12 @@ async def chat_endpoint(request: ChatRequest, current_user: dict = Depends(get_c
                         "message": request.message,
                         "session_id": session_id,
                         "tenant_id": tenant_id,
+                        "tenant_email": tenant_email,
                         "image_base64": request.image_base64,
                     },
                 )
 
+            execution_metadata = None
             if rca_resp.status_code == 200:
                 data = rca_resp.json()
 
@@ -375,6 +379,7 @@ async def chat_endpoint(request: ChatRequest, current_user: dict = Depends(get_c
                 else:
                     answer = data.get("answer") or ""
 
+                execution_metadata = data.get("execution")
                 execution_path = data.get("execution_path", "ai_rca_chat")
             else:
                 # AI-RCA unreachable — return friendly message
@@ -410,6 +415,15 @@ async def chat_endpoint(request: ChatRequest, current_user: dict = Depends(get_c
             )
             answer = result.get("answer", "")
             execution_path = "legacy_gateway_rag"
+            execution_metadata = {
+                "requestId": request_id,
+                "textProvider": "openai" if os.getenv("AI_PROVIDER") == "openai" else "bedrock",
+                "textModel": os.getenv("OPENAI_MODEL_NAME", "gpt-4o-mini") if os.getenv("AI_PROVIDER") == "openai" else "us.amazon.nova-pro-v1:0",
+                "mcpUsed": False,
+                "mcpCalls": [],
+                "ragUsed": True,
+                "visualProvider": None
+            }
         except Exception as rag_err:
             # Never expose raw error — return friendly message
             print(f"[ERROR] Legacy RAG failed (request_id={request_id}): {type(rag_err).__name__}")
@@ -427,6 +441,17 @@ async def chat_endpoint(request: ChatRequest, current_user: dict = Depends(get_c
         )
         execution_path = "unconfigured"
 
+    if not execution_metadata:
+        execution_metadata = {
+            "requestId": request_id,
+            "textProvider": "openai" if os.getenv("AI_PROVIDER") == "openai" else "bedrock",
+            "textModel": os.getenv("OPENAI_MODEL_NAME", "gpt-4o-mini") if os.getenv("AI_PROVIDER") == "openai" else "us.amazon.nova-pro-v1:0",
+            "mcpUsed": False,
+            "mcpCalls": [],
+            "ragUsed": False,
+            "visualProvider": None
+        }
+
     # ── Store assistant response ───────────────────────────────────────────────
     try:
         store_chat_message(
@@ -434,13 +459,14 @@ async def chat_endpoint(request: ChatRequest, current_user: dict = Depends(get_c
             session_id=session_id,
             role="assistant",
             content=answer,
+            execution=execution_metadata
         )
     except Exception as store_err:
         print(f"[WARN] Could not store assistant message: {store_err}")
 
     print(f"[CHAT] request_id={request_id} path={execution_path} session={session_id}")
 
-    return ChatResponse(answer=answer, session_id=session_id)
+    return ChatResponse(answer=answer, session_id=session_id, execution=execution_metadata)
 
 
 # ── Visual Asset Serving ───────────────────────────────────────────────────────
@@ -997,6 +1023,108 @@ def generate_incident_rca(incident_id: str, current_user: dict = Depends(get_cur
         raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
+
+def check_tenant_auth(token_payload: dict, requested_tenant_id: str):
+    if token_payload.get("client_id") == "mcp-dev-fallback":
+        return True
+    auth_tenant = token_payload.get("tenant_id")
+    if auth_tenant == "*" or auth_tenant == requested_tenant_id:
+        return True
+    auth_tenants = token_payload.get("authorized_tenants", [])
+    if requested_tenant_id in auth_tenants:
+        return True
+    raise HTTPException(status_code=403, detail="Not authorized to access the requested tenant's data")
+
+@app.get("/api/v1/mcp/incidents/{incident_id}")
+async def get_mcp_incident_by_id(
+    incident_id: str,
+    tenant_id: str,
+    service_token: dict = Depends(verify_mcp_service)
+):
+    check_tenant_auth(service_token, tenant_id)
+    try:
+        incidents_table = get_incidents_table()
+        response = incidents_table.get_item(Key={'tenant_id': tenant_id, 'incident_id': incident_id})
+        if 'Item' not in response:
+            raise HTTPException(status_code=404, detail=f"Incident {incident_id} not found")
+        return response['Item']
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.get("/api/v1/mcp/incidents")
+async def get_mcp_incidents(
+    tenant_id: str,
+    limit: int = 5,
+    service_token: dict = Depends(verify_mcp_service)
+):
+    check_tenant_auth(service_token, tenant_id)
+    try:
+        incidents_table = get_incidents_table()
+        response = incidents_table.query(
+            KeyConditionExpression=Key('tenant_id').eq(tenant_id),
+            Limit=min(limit, 20)
+        )
+        return response.get('Items', [])
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.get("/api/v1/mcp/service-health")
+async def get_mcp_service_health(
+    service_name: Optional[str] = None,
+    service_token: dict = Depends(verify_mcp_service)
+):
+    try:
+        logs_table = get_logs_table()
+        log_query = logs_table.query(Limit=100)
+        logs = log_query.get('Items', [])
+        
+        services = {}
+        for log in logs:
+            srv = log.get("service") or log.get("resource_id") or "api-gateway-service"
+            if srv not in services:
+                services[srv] = {"latency_sum": 0.0, "latency_count": 0, "warnings": 0, "errors": 0, "total": 0}
+            
+            lvl = (log.get("level") or "INFO").upper()
+            services[srv]["total"] += 1
+            if lvl == "WARN":
+                services[srv]["warnings"] += 1
+            elif lvl in ("ERROR", "CRITICAL", "FATAL"):
+                services[srv]["errors"] += 1
+                
+            lat = log.get("latency_ms")
+            if lat:
+                try:
+                    services[srv]["latency_sum"] += float(lat)
+                    services[srv]["latency_count"] += 1
+                except ValueError:
+                    pass
+                    
+        results = []
+        for srv, stats in services.items():
+            if service_name and srv != service_name:
+                continue
+                
+            errors = stats["errors"]
+            warnings = stats["warnings"]
+            avg_latency = stats["latency_sum"] / max(1, stats["latency_count"])
+            
+            health_score = 100 - (errors * 20) - (warnings * 5)
+            health_score = max(0, min(100, health_score))
+            
+            results.append({
+                "service": srv,
+                "health_score": health_score,
+                "avg_latency": round(avg_latency, 2),
+                "errors": errors,
+                "warnings": warnings
+            })
+            
+        return results
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
 
 github_deployments_cache = {}
 github_repo_workflow_cache = {}

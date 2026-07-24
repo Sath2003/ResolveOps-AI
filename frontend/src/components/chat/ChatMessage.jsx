@@ -424,6 +424,51 @@ function timeAgo(iso) {
   return new Date(iso).toLocaleDateString();
 }
 
+// ── ExecutionDetailsPanel ───────────────────────────────────────────────────
+function ExecutionDetailsPanel({ execution }) {
+  const [isOpen, setIsOpen] = useState(false);
+  if (!execution) return null;
+
+  const mcpCalls = execution.mcpCalls || [];
+
+  return (
+    <div className="mt-3 pt-2.5 border-t border-white/5 text-xs text-slate-400">
+      <button
+        onClick={() => setIsOpen(!isOpen)}
+        className="flex items-center gap-1 text-[10px] uppercase font-bold tracking-wider text-slate-500 hover:text-slate-300 transition-colors cursor-pointer"
+      >
+        {isOpen ? <ChevronDown size={11} /> : <ChevronRight size={11} />}
+        <Activity size={10} className="text-emerald-400 animate-pulse" />
+        <span>Execution Details</span>
+      </button>
+
+      {isOpen && (
+        <div className="mt-2 p-3 bg-black/40 rounded-xl border border-white/5 space-y-2 font-mono text-[10px]">
+          <div className="grid grid-cols-2 gap-x-4 gap-y-1.5 text-slate-400">
+            <div><span className="text-slate-600">Request ID:</span> {execution.requestId}</div>
+            <div><span className="text-slate-600">Text Provider:</span> {execution.textProvider} ({execution.textModel})</div>
+            <div><span className="text-slate-600">MCP Connected:</span> {execution.mcpUsed ? "Yes (Streamable HTTP)" : "No"}</div>
+            <div><span className="text-slate-600">RAG Used:</span> {execution.ragUsed ? "Yes" : "No"}</div>
+          </div>
+          {mcpCalls.length > 0 && (
+            <div className="mt-2 space-y-1">
+              <div className="text-[9px] uppercase tracking-wider text-slate-500 font-bold">MCP Tool Invocations:</div>
+              {mcpCalls.map((call, i) => (
+                <div key={i} className="flex items-center justify-between py-0.5 border-b border-white/5 last:border-0 text-slate-350">
+                  <span>{call.tool} ({call.domain})</span>
+                  <span className={`px-1.5 py-0.2 rounded text-[8px] uppercase font-bold ${call.status === "success" ? "bg-emerald-500/10 text-emerald-400 border border-emerald-500/20" : "bg-rose-500/10 text-rose-400 border border-rose-500/20"}`}>
+                    {call.status}
+                  </span>
+                </div>
+              ))}
+            </div>
+          )}
+        </div>
+      )}
+    </div>
+  );
+}
+
 // ── MessageBubble ─────────────────────────────────────────────────────────────
 export function MessageBubble({ msg, onRetry }) {
   const isRCA = msg.rca_data && (msg.rca_data.investigation_id || msg.rca_data.probable_root_cause);
@@ -523,6 +568,7 @@ export function MessageBubble({ msg, onRetry }) {
             </ReactMarkdown>
           </div>
         )}
+        {msg.execution && <ExecutionDetailsPanel execution={msg.execution} />}
         {msg.timestamp && (
           <p className="text-[10px] text-slate-600 mt-2">{timeAgo(msg.timestamp)}</p>
         )}

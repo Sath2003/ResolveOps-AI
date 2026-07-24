@@ -12,6 +12,8 @@ services:
       POSTGRES_DB: ${POSTGRES_DB:-resolveopsdb}
     volumes:
       - postgres_data:/var/lib/postgresql/data
+    networks:
+      - backend-net
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-resolveopsadmin}"]
       interval: 10s
@@ -26,7 +28,8 @@ services:
       - "3000:3000"
     environment:
       - NEXT_PUBLIC_API_BASE_URL=/api
-      # OPENAI_API_KEY is intentionally NOT passed to the frontend container
+    networks:
+      - frontend-net
     depends_on:
       - api-gateway-service
     restart: unless-stopped
@@ -43,6 +46,9 @@ services:
     volumes:
       - ./data:/app/data
       - generated_visuals:/app/data/visuals
+    networks:
+      - frontend-net
+      - backend-net
     depends_on:
       postgres:
         condition: service_healthy
@@ -58,40 +64,56 @@ services:
   auth-service:
     build:
       context: ./services/auth-service
-    ports:
-      - "8001:8000"
     env_file:
       - .env
+    networks:
+      - backend-net
+    depends_on:
+      postgres:
+        condition: service_healthy
     restart: unless-stopped
 
   github-intelligence-service:
     build:
       context: ./services/github-intelligence-service
-    ports:
-      - "8002:8000"
     env_file:
       - .env
+    networks:
+      - backend-net
     restart: unless-stopped
 
   aws-intelligence-service:
     build:
       context: ./services/aws-intelligence-service
-    ports:
-      - "8004:8000"
     env_file:
       - .env
+    networks:
+      - backend-net
+    restart: unless-stopped
+
+  azure-intelligence-service:
+    build:
+      context: ./services/azure-intelligence-service
+    env_file:
+      - .env
+    networks:
+      - backend-net
+    depends_on:
+      postgres:
+        condition: service_healthy
     restart: unless-stopped
 
   mcp-server-service:
     build:
       context: ./services/mcp-server-service
-    ports:
-      - "8007:8000"
     env_file:
       - .env
+    networks:
+      - backend-net
     depends_on:
       - aws-intelligence-service
       - github-intelligence-service
+      - azure-intelligence-service
       - docker-evidence-adapter
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
@@ -103,10 +125,10 @@ services:
   docker-evidence-adapter:
     build:
       context: ./services/docker-evidence-adapter
-    ports:
-      - "8008:8000"
     env_file:
       - .env
+    networks:
+      - backend-net
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock:ro
     healthcheck:
@@ -128,6 +150,8 @@ services:
       - OPENAI_MODEL=${OPENAI_MODEL_NAME:-gpt-4o-mini}
     volumes:
       - generated_visuals:/app/data/visuals
+    networks:
+      - backend-net
     depends_on:
       - mcp-server-service
     healthcheck:
@@ -140,13 +164,18 @@ services:
   notification-service:
     build:
       context: ./services/notification-service
-    ports:
-      - "8006:8000"
     env_file:
       - .env
+    networks:
+      - backend-net
     restart: unless-stopped
+
+networks:
+  frontend-net:
+    driver: bridge
+  backend-net:
+    driver: bridge
 
 volumes:
   postgres_data:
   generated_visuals:
-

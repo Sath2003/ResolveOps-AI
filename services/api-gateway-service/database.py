@@ -216,7 +216,7 @@ def get_latest_deployment(tenant_id: str):
         print(f"Failed to retrieve latest deployment: {e}")
         return None
 
-def store_chat_message(tenant_id: str, session_id: str, role: str, content: str, image_base64=None) -> bool:
+def store_chat_message(tenant_id: str, session_id: str, role: str, content: str, image_base64=None, execution=None) -> bool:
     timestamp = datetime.datetime.utcnow().isoformat() + "Z"
     try:
         table = get_chat_history_table()
@@ -226,7 +226,8 @@ def store_chat_message(tenant_id: str, session_id: str, role: str, content: str,
             'session_id': session_id,
             'role': role,
             'content': content,
-            'image_base64': image_base64
+            'image_base64': image_base64,
+            'execution': execution
         })
         return True
     except Exception as e:

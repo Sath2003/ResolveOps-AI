@@ -121,37 +121,16 @@ class InvestigationOrchestrator:
         tools_used: List[ToolCall] = []
         live_evidence: List[EvidenceItem] = []
 
-        # ── Step 1: MCP Evidence Collection ──────────────────────────────────
-        if settings.MCP_RCA_ENABLED:
-            tools_used, live_evidence = await self._collect_mcp_evidence(
-                request, investigation_id, request_id
-            )
+        query = request.question
+        if not query:
+            query = f"Investigate incident {request.incident_id}" if request.incident_id else f"Analyze service {request.service}"
 
-        # ── Step 2: Build evidence context for Bedrock ────────────────────────
-        evidence_context = self._format_evidence_context(
-            request, live_evidence, tools_used
-        )
-
-        # ── Step 3: Bedrock RCA generation ────────────────────────────────────
         try:
-            raw_json = await asyncio.wait_for(
-                asyncio.to_thread(
-                    bedrock_client.invoke,
-                    evidence_context,
-                    _RCA_SYSTEM_PROMPT,
-                    max_tokens=4096,
-                    temperature=0.1,
-                    request_id=request_id,
-                ),
-                timeout=settings.RCA_INVESTIGATION_TIMEOUT_SECONDS,
-            )
-        except _SafeError as exc:
-            return self._error_response(exc.response, investigation_id, tools_used)
-        except asyncio.TimeoutError:
-            return self._error_response(
-                build_error_response(ErrorCode.INVESTIGATION_TIMEOUT, request_id),
-                investigation_id,
-                tools_used,
+            raw_json, tools_used, live_evidence = await self._run_mcp_agent_loop(
+                initial_message=query,
+                system_prompt=_RCA_SYSTEM_PROMPT,
+                request_id=request_id,
+                tenant_email=request.tenant_email
             )
         except Exception as exc:
             code = classify_provider_exception(exc)
@@ -161,9 +140,27 @@ class InvestigationOrchestrator:
                 tools_used,
             )
 
-        # ── Step 4: Parse structured Bedrock output ───────────────────────────
         parsed = self._parse_bedrock_json(raw_json)
         duration = time.monotonic() - start_time
+
+        execution_calls = []
+        for tc in tools_used:
+            execution_calls.append({
+                "server": "operations",
+                "domain": tc.tool_name.split(".")[0] if "." in tc.tool_name else tc.tool_name.split("_")[0],
+                "tool": tc.tool_name,
+                "status": "success" if tc.success else "error"
+            })
+            
+        execution_metadata = {
+            "requestId": request_id,
+            "textProvider": settings.AI_PROVIDER,
+            "textModel": settings.OPENAI_MODEL if settings.AI_PROVIDER == "openai" else settings.BEDROCK_MODEL_ID,
+            "mcpUsed": len(tools_used) > 0,
+            "mcpCalls": execution_calls,
+            "ragUsed": False,
+            "visualProvider": None
+        }
 
         if not parsed:
             logger.warning(
@@ -186,6 +183,7 @@ class InvestigationOrchestrator:
                 "historical_evidence": [],
                 "tools_used": [t.dict() for t in tools_used],
                 "investigation_duration_seconds": round(duration, 2),
+                "execution": execution_metadata
             }
 
         insufficient = parsed.get("insufficient_evidence_warning")
@@ -198,8 +196,6 @@ class InvestigationOrchestrator:
                 "status": status,
                 "confidence": parsed.get("confidence"),
                 "duration_seconds": round(duration, 2),
-                "tools_called": len(tools_used),
-                "evidence_items": len(live_evidence),
             },
         )
 
@@ -218,7 +214,8 @@ class InvestigationOrchestrator:
             "historical_evidence": [],
             "tools_used": [t.dict() for t in tools_used],
             "investigation_duration_seconds": round(duration, 2),
-            "answer": parsed.get("probable_root_cause", "Investigation completed. See structured fields."),
+            "answer": parsed.get("probable_root_cause", "Investigation completed."),
+            "execution": execution_metadata
         }
 
     async def chat(
@@ -337,10 +334,31 @@ class InvestigationOrchestrator:
             }
 
         if intent in non_visual_intents:
+            tools_used: List[ToolCall] = []
+            live_evidence: List[EvidenceItem] = []
+            mcp_executed = False
+
+            msg_lower = message.lower()
+            keywords = [
+                "incident", "service", "health", "log", "error", "fail",
+                "docker", "aws", "cloudwatch", "cloudtrail", "github",
+                "ec2", "investigate", "rca", "status", "metrics"
+            ]
+            mcp_needed = any(kw in msg_lower for kw in keywords)
+
             try:
-                answer = await asyncio.to_thread(
-                    _invoke, message, _CHAT_SYSTEM_PROMPT, 2048, 0.3
-                )
+                if settings.MCP_RCA_ENABLED and mcp_needed:
+                    answer, tools_used, live_evidence = await self._run_mcp_agent_loop(
+                        initial_message=message,
+                        system_prompt=_CHAT_SYSTEM_PROMPT,
+                        request_id=request_id,
+                        tenant_email=tenant_email
+                    )
+                    mcp_executed = len(tools_used) > 0
+                else:
+                    answer = await asyncio.to_thread(
+                        _invoke, message, _CHAT_SYSTEM_PROMPT, 2048, 0.3
+                    )
             except _SafeError as exc:
                 return self._chat_error_response(request_id, session_id, exc.response)
             except Exception as exc:
@@ -348,14 +366,38 @@ class InvestigationOrchestrator:
                 return self._chat_error_response(
                     request_id, session_id, build_error_response(code, request_id)
                 )
+
+            execution_calls = []
+            for tc in tools_used:
+                execution_calls.append({
+                    "server": "operations",
+                    "domain": tc.tool_name.split(".")[0] if "." in tc.tool_name else tc.tool_name.split("_")[0],
+                    "tool": tc.tool_name,
+                    "status": "success" if tc.success else "error"
+                })
+
+            execution_metadata = {
+                "requestId": request_id,
+                "textProvider": settings.AI_PROVIDER,
+                "textModel": settings.OPENAI_MODEL if settings.AI_PROVIDER == "openai" else settings.BEDROCK_MODEL_ID,
+                "mcpUsed": mcp_executed,
+                "mcpCalls": execution_calls,
+                "ragUsed": False,
+                "visualProvider": None
+            }
+
             return {
                 "request_id": request_id,
                 "session_id": session_id,
                 "answer": answer,
-                "execution_path": "text_chat",
+                "execution_path": "mcp_chat_assisted" if mcp_executed else "text_chat",
+                "tools_used": [t.dict() for t in tools_used],
+                "live_evidence": [e.dict() for e in live_evidence],
                 "response_type": intent.value,
                 "status": "success",
+                "execution": execution_metadata
             }
+
 
         # ── Step 3: Visual intents — plan visual spec ─────────────────────────
         logger.info(
@@ -909,6 +951,128 @@ class InvestigationOrchestrator:
             "historical_evidence": [],
             **error_payload,
         }
+
+    async def _run_mcp_agent_loop(
+        self,
+        initial_message: str,
+        system_prompt: str,
+        request_id: str,
+        tenant_email: Optional[str] = None
+    ) -> Tuple[str, List[ToolCall], List[EvidenceItem]]:
+        """
+        Runs a standard agentic tool-use loop with Bedrock/OpenAI.
+        Returns (final_text, tools_used, live_evidence).
+        """
+        tools = await mcp_client.list_tools() if settings.MCP_RCA_ENABLED else []
+        messages = [{"role": "user", "content": initial_message}]
+        
+        tools_used = []
+        live_evidence = []
+        
+        rounds = 0
+        MAX_ROUNDS = 3
+        
+        while rounds < MAX_ROUNDS:
+            rounds += 1
+            response_msg = await asyncio.to_thread(
+                bedrock_client.converse_with_tools,
+                messages=messages,
+                system_prompt=system_prompt,
+                tools=tools,
+                max_tokens=4096,
+                temperature=0.1,
+                request_id=request_id
+            )
+            
+            messages.append({
+                "role": "assistant",
+                "content": response_msg["content"],
+                "tool_calls": response_msg.get("tool_calls", [])
+            })
+            
+            tool_calls = response_msg.get("tool_calls", [])
+            if not tool_calls:
+                return response_msg["content"], tools_used, live_evidence
+                
+            for tc in tool_calls:
+                tool_name = tc["name"]
+                arguments = tc["arguments"]
+                if "kubernetes" in tool_name.lower():
+                    arguments = {**arguments, "tenant_email": tenant_email}
+                    
+                t_start = time.monotonic()
+                try:
+                    result = await mcp_client.call_tool(
+                        tool_name=tool_name,
+                        inputs=arguments,
+                        request_id=request_id,
+                        tenant_id=tenant_email
+                    )
+                    elapsed_ms = int((time.monotonic() - t_start) * 1000)
+                    tools_used.append(
+                        ToolCall(
+                            tool_name=tool_name,
+                            inputs=arguments,
+                            duration_ms=elapsed_ms,
+                            success=True
+                        )
+                    )
+                    
+                    evidence = result.get("evidence", [])
+                    for e in evidence[:settings.RCA_MAX_EVIDENCE_ITEMS]:
+                        live_evidence.append(
+                            EvidenceItem(
+                                source=e.get("source", tool_name.split(".")[0] if "." in tool_name else tool_name.split("_")[0]),
+                                resource=e.get("resource"),
+                                evidence_type=e.get("evidence_type", "event"),
+                                collection_timestamp=e.get(
+                                    "timestamp",
+                                    time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+                                ),
+                                summary=e.get("summary", "")[:500],
+                                is_live=True,
+                                citation=e.get("citation"),
+                                raw_preview=e.get("raw_preview")[:300] if e.get("raw_preview") else None
+                            )
+                        )
+                        
+                    messages.append({
+                        "role": "tool",
+                        "tool_call_id": tc["id"],
+                        "name": tool_name,
+                        "output": result.get("raw_result") or result
+                    })
+                except Exception as exc:
+                    elapsed_ms = int((time.monotonic() - t_start) * 1000)
+                    error_code = getattr(exc, "error_code", ErrorCode.INTERNAL_SERVICE_ERROR)
+                    tools_used.append(
+                        ToolCall(
+                            tool_name=tool_name,
+                            inputs=arguments,
+                            duration_ms=elapsed_ms,
+                            success=False,
+                            error_code=error_code
+                        )
+                    )
+                    messages.append({
+                        "role": "tool",
+                        "tool_call_id": tc["id"],
+                        "name": tool_name,
+                        "is_error": True,
+                        "output": {"error": str(exc)}
+                    })
+                    
+        # Exceeded max rounds
+        final_response = await asyncio.to_thread(
+            bedrock_client.converse_with_tools,
+            messages=messages,
+            system_prompt=system_prompt,
+            tools=[],
+            max_tokens=2048,
+            temperature=0.1,
+            request_id=request_id
+        )
+        return final_response["content"], tools_used, live_evidence
 
 
 # Module-level singleton

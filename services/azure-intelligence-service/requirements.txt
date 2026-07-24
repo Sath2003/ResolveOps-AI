@@ -2,3 +2,9 @@ fastapi
 uvicorn
 requests
 pydantic
+sqlalchemy
+psycopg2-binary
+pyyaml
+kubernetes>=30.0.0
+azure-mgmt-containerservice
+azure-identity

@@ -14,6 +14,7 @@ class InvestigationRequest(BaseModel):
     time_window_minutes: int = Field(60, ge=5, le=1440)
     session_id: Optional[str] = None
     tenant_id: Optional[str] = None
+    tenant_email: Optional[str] = None
 
 
 class ChatRequest(BaseModel):
@@ -21,6 +22,7 @@ class ChatRequest(BaseModel):
     message: str
     session_id: Optional[str] = None
     tenant_id: Optional[str] = None
+    tenant_email: Optional[str] = None
     image_base64: Optional[str] = None
     previous_visual_spec: Optional[dict] = None  # For conversational visual editing
 

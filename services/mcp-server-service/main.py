@@ -34,10 +34,28 @@ from app.tools.resolveops_tools import (
     resolveops_get_service_health,
 )
 
+# FastMCP imports
+from app.mcp.server import fastmcp_asgi_app
+from app.mcp.auth import verify_mcp_auth
+
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("mcp-server")
 
 app = FastAPI(title="mcp-server-service", version="1.0.0")
+
+# Security middleware for standards-compliant FastMCP endpoints mounted at /mcp
+@app.middleware("http")
+async def mcp_auth_middleware(request: Request, call_next):
+    if request.url.path.startswith("/mcp"):
+        try:
+            await verify_mcp_auth(request)
+        except HTTPException as exc:
+            return JSONResponse(status_code=exc.status_code, content={"detail": exc.detail})
+    return await call_next(request)
+
+# Mount FastMCP under /mcp
+app.mount("/mcp", fastmcp_asgi_app)
+
 
 # Dispatch map: tool_name -> async function
 TOOL_DISPATCH = {
